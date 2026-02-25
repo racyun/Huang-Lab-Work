@@ -18,6 +18,8 @@ In our project, we use MAE as a pretraining method for object detection. In the 
 
 In the second stage, we move to supervised object detection. We take the pretrained MAE encoder weights and use them as the backbone of an object detection network, then add a detection head on top. During fine-tuning, the input is an image and the model outputs bounding boxes and class labels. The training objective switches from reconstruction loss to a detection loss. By starting from an MAE-pretrained backbone, the detector can leverage the rich visual representations learned during self-supervised training, which can improve performance—especially when labeled detection data is limited.
 
+We drew from this repo for most of our code: https://github.com/facebookresearch/mae.
+
 
 
 DATA:
