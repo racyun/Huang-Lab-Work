@@ -4,7 +4,7 @@ Welcome to our work on the at the Ngan Huang Lab! Our project focuses on applyin
 
 This repository contains our dataloader, image data, and model (masked autonencoder, aka an MAE).
 
-Model:
+MODEL ARCHITECTURE:
 ------------------------------------------------------------------------------------------------------------------------------------------------
 For this project, we focused on an object detection task—predicting the red spots in the overlay (with bounding box coordinates of these red spots as the labels), given the corresponding z-stack, focused-stack, and hbrid images belonging to that environment (inputs). Our thinking is that reliably pinpointing these red-spot regions will help identify where endothelial cells may later de-differentiate into a mesenchymal phenotype.
 
@@ -92,6 +92,10 @@ Counts
 - 222 samples at 900 kPa
 - 222 samples at 5 kPa
 - 444 hybrid images total
+
+
+
+
 
 
 
