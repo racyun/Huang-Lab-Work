@@ -93,9 +93,6 @@ Counts
 - 222 samples at 5 kPa
 - 444 hybrid images total
 
-
-
-<br>
 <br>
 <br>
 
