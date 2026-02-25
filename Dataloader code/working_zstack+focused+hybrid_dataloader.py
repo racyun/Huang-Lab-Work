@@ -1,3 +1,5 @@
+'''NOTE: THIS CODE IS NOT ADAPTED TO BE RUN LOCALLY. IT MUST BE RUN ON GOOGLE COLAB.'''
+
 # -*- coding: utf-8 -*-
 """WORKING zstack+focused+hybrid dataloader.ipynb
 
