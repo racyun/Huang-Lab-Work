@@ -119,3 +119,7 @@ Next, we collated these into a single custom dataset so that each sample contain
 
 In the end, the final dataset contained 444 total samples (222 at 5 kPa and 222 at 900 kPa), which we shuffled together into one combined dataset and wrapped in a PyTorch DataLoader.
 
+
+RELEVANT PAPERS:
+------------------------------------------------------------------------------------------------------------------------------------------------
+Jain, I., Chan, A.H.P., Yang, G. et al. Combinatorial extracellular matrix tissue chips for optimizing mesenchymal stromal cell microenvironment and manufacturing. npj Regen Med 10, 21 (2025). https://doi.org/10.1038/s41536-025-00408-z
