@@ -1,125 +1,99 @@
-# Huang-Lab-Work
+# Huang Lab — tissue-chip vision (MAE → detection)
 
-Welcome to our work on the at the Ngan Huang Lab! Our project focuses on applying AI/ML (specifically computer vision techniques) to synthetic cardiovascular tissue-on-a-chip images. We are currently training object-detection models to predict endothelial-to-mesenchymal transition sites in atherosclerosis-on-a-chip systems. The goal is to generate spatial predictions revealing where vascular plaque forms and stiffens in early-stage atherosclerosis, a leading cause of heart attack and stroke. We are training our models to recognize both ___ features——stiffness of the extracellular environment (ECM), ECM materials and their effect on the dedifferentiation behavior——as well as subtle features such as morpohology, neighborhood interactions, and spatial context. 
+This repository is being refactored for **multi-encoder MAE pretraining** and **Deformable-DETR-style bounding-box detection** on cardiovascular tissue-on-chip data (z-stack, focused stack, hybrid, stiffness, and bbox labels).
 
-This repository contains our dataloader, image data, and model (masked autonencoder, aka an MAE).
+## Layout (source of truth)
 
-MODEL ARCHITECTURE:
-------------------------------------------------------------------------------------------------------------------------------------------------
-For this project, we focused on an object detection task—predicting the red spots in the overlay (with bounding box coordinates of these red spots as the labels), given the corresponding z-stack, focused-stack, and hbrid images belonging to that environment (inputs). Our thinking is that reliably pinpointing these red-spot regions will help identify where endothelial cells may later de-differentiate into a mesenchymal phenotype.
+| Path | Role |
+|------|------|
+| `config/` | YAML defaults + dataclass schema; use `config/local.yaml` (gitignored) for machine-specific paths. |
+| `data/` | `TissueChipDataset`, pretrain transforms, optional disk cache, detection dataset + COCO-style boxes. |
+| `models/` | 2D MAE (`mae.py`), volume MAE (`mae_volume.py`), `MultiEncoderMAE` + stiffness MLP (`multi_mae.py`, `stiffness.py`). |
+| `training/` | `main_pretrain.py` / `engine_pretrain.py`, `main_detect.py` / `engine_detect.py`, LR schedule. |
+| `scripts/` | `train_pretrain.py` (`--smoke`, `--train`, `--inspect-data`), `train_detect.py`. |
+| `utils/` | Checkpoint I/O, logging helpers. |
+| `requirements.txt` | Pinned dependency ranges (see below). |
+| `archive/` | **Legacy only** — old Colab dataloaders and full Meta MAE clone (see `archive/README.md`). |
 
-A Masked Autoencoder (MAE) is a self-supervised model that learns by hiding most of an input image and forcing itself to reconstruct what is missing. Given an image 𝑥, the MAE randomly masks out a large fraction of the image (often around 75%) and trains the model to predict the missing content. Because it learns to reconstruct the image without any human-provided labels, it can learn useful visual structure in a label-free way.
+Run scripts from the repo root (they add the root to `sys.path`):
 
-The MAE process works as follows. First, the image is split into small patches, and each patch is converted into a vector representation (a patch embedding). Next, most of these patches are randomly masked so that the model only sees a small subset of the image. The encoder (typically a Vision Transformer, or ViT) processes only the visible patches, which makes training more efficient. After that, mask tokens are inserted for the missing patches. These tokens act like learned placeholders: they tell the model that a patch exists in that location, but its actual contents are hidden. Because the mask tokens are trainable, the model gradually learns how to interpret them during training. Finally, a decoder takes the visible-patch representations plus the mask tokens and attempts to reconstruct the full image. Importantly, the reconstruction loss is computed only on the masked patches, so the model is specifically rewarded for predicting what it could not see.
+```bash
+pip install -r requirements.txt
+# Random-tensor sanity check (multi-encoder + stiffness)
+python scripts/train_pretrain.py --smoke
+# Full pretrain (needs data paths in config/local.yaml)
+python scripts/train_pretrain.py --train --local-config config/local.yaml
+# One batch shapes from real data
+python scripts/train_pretrain.py --inspect-data --local-config config/local.yaml
+# Deformable-DETR fine-tune (HuggingFace; downloads SenseTime/deformable-detr by default)
+python scripts/train_detect.py --local-config config/local.yaml
+```
 
-This setup encourages the model to learn strong visual features. To fill in missing regions correctly, it must understand shapes, textures, edges, spatial relationships, and context—for example, inferring what is likely nearby based on the visible portion of a cell image. In other words, MAE forces the encoder to build useful internal representations of image structure without relying on labels.
+`--inspect-data` / `--train` need valid `dataset.splits[*]` roots. Set `dataset.cache_dir` to cache per-sample `.pt` dicts and limit repeated I/O.
 
-In our project, we use MAE as a pretraining method for object detection. In the first stage, we perform self-supervised MAE pretraining using only raw images, with no bounding boxes or class labels. The model is trained to reconstruct masked patches, using a reconstruction loss such as mean squared error (MSE). This produces a pretrained encoder backbone that has already learned strong visual features from the image data.
+## Model overview
 
-In the second stage, we move to supervised object detection. We take the pretrained MAE encoder weights and use them as the backbone of an object detection network, then add a detection head on top. During fine-tuning, the input is an image and the model outputs bounding boxes and class labels. The training objective switches from reconstruction loss to a detection loss. By starting from an MAE-pretrained backbone, the detector can leverage the rich visual representations learned during self-supervised training, which can improve performance—especially when labeled detection data is limited.
+- **Focused & hybrid**: standard 2D MAE (`MaskedAutoencoderViT`) on `224×224` (configurable).
+- **Z-stack**: **VideoMAE-style** volume MAE (`MaskedAutoencoderVolume`) on `[C,Z,H,W]` with 3D tube embedding `(tublet_z, patch_xy, patch_xy)` and flat sin-cos positions over tube indices.
+- **Stiffness**: shared `StiffnessMLP` maps normalized kPa `[B,1] → [B,D]` and the result is **added to every patch token** (after spatial pos embed, before masking) for all three encoders.
+- **Pretrain loss**: `w_f·L_focus + w_h·L_hybrid + w_z·L_volume` with **separate optimizer param groups** and per-head LR multipliers (`multi_mae.lr_mult_*`).
+- **Detection**: `training/main_detect.py` loads **`SenseTime/deformable-detr`** via `transformers` and trains on **normalized cxcywh** boxes. The default backbone is **ResNet**; `detection.mae_encoder_ckpt` is reserved for when you attach a **ViT encoder** — use `models/weight_loaders.load_mae_encoder_from_multimae_ckpt` on your backbone module.
 
-We drew from this repo for most of our code: https://github.com/facebookresearch/mae.
+### Indexing / focus count mismatch
 
+Wells are indexed by **intersection**: z-stack + hybrid + label + a focus file whose path contains `W###`. Wells that appear in z/hybrid but lack a focus image are **skipped**, so counts can be below 222 without manual alignment.
 
+## Science / data (brief)
 
-DATA:
-------------------------------------------------------------------------------------------------------------------------------------------------
-Dataset link: https://drive.google.com/drive/folders/120bWbdzPsHad-nqh-NdEAk-3PQ-vNyxJ
+Project context: AI/ML for synthetic cardiovascular tissue-on-chip images; targets include ECM stiffness and morphology. Per-sample inputs: **140 z-slices**, one **focused** image, one **hybrid** image, **stiffness (kPa)**, and **bounding-box labels** (comma-separated lines in `W###.txt` files). Dataset layout details were documented in earlier commits; see `archive/legacy_colab_dataloaders/` for Colab-era notes.
 
-This dataset contains image data from two cellular-environment stiffness conditions:
-- 5 kPa
-- 900 kPa
+## Configuration
 
-For each stiffness, data is provided in three formats:
-- Z-stack (raw)
-- Focused stack (focus-stacked overlay)
-- Hybrid (processed overlay)
+1. Copy `config/local.yaml.example` → `config/local.yaml`.
+2. Set `dataset.splits[*].{zstack_root,focused_root,hybrid_root,labels_root}` to your drive or NFS paths (Colab, cluster, or laptop — only paths change).
+3. Optional: adjust `dataset.resize` so each modality has consistent `H×W` within the batch (native resolution works if all images in a modality already match).
 
-That makes six total top-level folders (3 formats × 2 stiffnesses).
+### Ambiguities you may need to resolve
 
-**1) Z-stack Images (raw, highest-volume data)**
--------------------------------------------------
+- **Focus images**: discovery uses `dataset.focus_filename_glob` (default `*focus_stacked*.tif`) and regex `W\d{3}` in the **full path**. If your naming differs, change the glob or extend `discover_focus_paths` in `data/modalities.py`.
+- **Hybrid folder template**: default `hybrid_results_{well_id}`; override `hybrid_folder_template` in YAML if your tree differs.
+- **Z-slice count**: default expected count is 140; a warning is emitted on mismatch (non-fatal).
+- **Bounding-box format**: one box per line, four comma-separated floats (assumed `x1,y1,x2,y2`). If labels use another convention, update `data/boxes.py` **after confirming with your lab**.
 
-Folders:
-- 250811_Athchip_noninflam_900kPa
-- 250814_Athchip_non-inflam_5kPa
+## Dependencies
 
-These are the rawest images in the dataset. Many individual slices are not fully in focus, but this format provides the largest amount of training data.
+Versions are chosen for **timm ≥ 1.0** (`PatchEmbed` / `Block` from `timm.layers` with fallbacks). A typical stack:
 
-Structure:
-- Each folder contains 222 sample folders (W000, W001, ..., W222)
-- Inside each W### folder is a subfolder: P00001
-- Inside P00001 are 140 .tif images
-- These 140 images together form the z-stack for one sample (one extracellular environment).
+- `torch` / `torchvision`: install the wheel that matches your CUDA runtime from [pytorch.org](https://pytorch.org) if needed.
+- `timm>=1.0.12`
+- `transformers`, `accelerate` (detection)
+- `PyYAML`, `Pillow`, `numpy`
 
-Counts
-- 222 samples at 900 kPa
-- 222 samples at 5 kPa
-- 444 total samples (environments)
-- 140 images per sample
-- 61,600 images total across both stiffnesses
+## Repository audit (post-refactor)
 
-These z-stack images make up roughly 90–95% of the total training data by image count.
+### Active files (canonical)
 
-**2) Focused Stack Images (high-definition focus overlays)**
-------------------------------------------------------------
-Folders
-- 20251027_2123__FocusStack_250811_Athchip_noninflam_900kPa
-- 20251027_2215__FocusStack_250814_Athchip_non-inflam_5kPa
+- `README.md`, `requirements.txt`, `.gitignore`
+- `config/default.yaml`, `config/local.yaml.example`, `config/__init__.py`, `config/settings.py`
+- `data/*.py` (incl. `pretrain_dataset.py`, `detection_dataset.py`, `cache.py`)
+- `models/mae.py`, `mae_volume.py`, `multi_mae.py`, `stiffness.py`, `weight_loaders.py`, `pos_embed.py`
+- `training/*.py`
+- `utils/__init__.py`, `utils/checkpoint.py`, `utils/logging_utils.py`
+- `scripts/train_pretrain.py`, `scripts/train_detect.py`
+- `archive/README.md` + everything under `archive/legacy_*` (frozen reference)
 
-These folders contain focus-stacked overlay images, which are generally more in focus, higher-definition, and more informative than individual z-stack slices.
+### Archived / duplicate legacy (not source of truth)
 
-Structure
-- One image per sample (extracellular environment)
-- Counts
-- 220 images in the 900 kPa folder
-- 220 images in the 5 kPa folder
-- 440 focused-stack images total
+| Location | Notes |
+|----------|--------|
+| `archive/legacy_colab_dataloaders/` | Three overlapping Colab exports (`disk_cached_*`, `working_*`, `ten_sample_*`), Google Drive paths, `google.colab` imports. **Superseded by** `data/`. |
+| `archive/legacy_facebook_mae/` | Full MAE repo: `main_finetune.py` (classification), `main_linprobe.py`, Slurm `submitit_*`, `util/datasets.py` (ImageFolder), `models_vit.py`, demo notebook, docs. **Encoder/MAE pieces reimplemented in** `models/`; training loop trimmed to `scripts/train_pretrain.py`. |
 
-**3) Hybrid Images (high-definition processed overlays)**
----------------------------------------------------------
-Folders
-- 250811_Athchip_noninflam_900kPa_HybridResults
-- 250814_Athchip_non-inflam_5kPa_HybridResults
+### Removed from “active” surface (by design)
 
-These folders contain hybrid processed overlay images, also high-definition and highly informative.
+- ImageNet `ImageFolder` pretrain/finetune drivers (remain in `archive/` only).
+- ViT **classification** head (`models_vit.py` in archive) — superseded by HuggingFace detection fine-tuning + optional ViT backbone wiring.
 
-Structure
-- Each folder contains 222 subfolders:
-    - hybrid_results_W001, hybrid_results_W002, ..., hybrid_results_W222
-      - Each subfolder contains one .tif image
-        - Each image corresponds to one sample (one extracellular environment)
+## License
 
-Counts
-- 222 samples at 900 kPa
-- 222 samples at 5 kPa
-- 444 hybrid images total
-
-<br>
-<br>
-
-DATALOADER DETAILS:
-------------------------------------------------------------------------------------------------------------------------------------------------
-We built a custom Colab data-loading pipeline to load this dataset and map all images from each extracellular environment to a single label. For each sample, the label was a .txt file containing bounding boxes, where each line stored one bounding box as four comma-separated coordinates.
-
-The bounding-box labels were stored in Google Drive under two directories, one for each stiffness condition.
-Within each directory, the label files were named W001, W002, W003, ..., W222 (as .txt files), with each file corresponding to one extracellular environment.
-
-To organize the image data, we first wrote code that loaded each of the six data directories as its own custom dataset. We then built a class that joined all image files and metadata needed for a given sample, while also returning stiffness (kPa) as an additional model input feature (as a tensor).
-
-Each sample consisted of 142 input images total:
-- 140 images from the z-stack
-- 1 image from the focus-stacked data
-- 1 image from the hybrid data
-
-Next, we collated these into a single custom dataset so that each sample contained:
-- the full set of 142 input images,
-- the stiffness annotation (5 kPa or 900 kPa), and
-- the corresponding bounding-box label file (.txt).
-
-In the end, the final dataset contained 444 total samples (222 at 5 kPa and 222 at 900 kPa), which we shuffled together into one combined dataset and wrapped in a PyTorch DataLoader.
-
-
-RELEVANT PAPERS:
-------------------------------------------------------------------------------------------------------------------------------------------------
-Jain, I., Chan, A.H.P., Yang, G. et al. Combinatorial extracellular matrix tissue chips for optimizing mesenchymal stromal cell microenvironment and manufacturing. npj Regen Med 10, 21 (2025). https://doi.org/10.1038/s41536-025-00408-z
+The original MAE code is CC-BY-NC (see `archive/legacy_facebook_mae/LICENSE`). New project files follow the same academic use pattern unless your lab specifies otherwise.
