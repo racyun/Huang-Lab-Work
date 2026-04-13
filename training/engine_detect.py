@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 
 from config.settings import FullConfig
 
@@ -12,7 +11,7 @@ def train_one_epoch_detect(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     cfg: FullConfig,
-    scaler: GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
 ) -> float:
     model.train()
     total, n = 0.0, 0
@@ -26,7 +25,7 @@ def train_one_epoch_detect(
             labels.append({k: v.to(device, non_blocking=True) for k, v in lab.items()})
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             out = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
             loss = out.loss
 

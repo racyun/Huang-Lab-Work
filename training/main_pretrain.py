@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 import torch
-from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
 from config import load_config
@@ -14,7 +13,7 @@ from data.pretrain_dataset import build_pretrain_dataset
 from models.multi_mae import build_multi_encoder_mae, param_groups_with_head_lrs
 from training.engine_pretrain import train_one_epoch
 from training.lr_sched import set_epoch_learning_rates
-from utils.checkpoint import save_checkpoint
+from utils.checkpoint import load_checkpoint, save_checkpoint
 
 
 def run_pretrain(
@@ -40,11 +39,7 @@ def run_pretrain(
 
     model = build_multi_encoder_mae(cfg.multi_mae).to(device)
     if resume is not None:
-        ckpt = torch.load(resume, map_location="cpu", weights_only=False)
-        if isinstance(ckpt, dict) and "model" in ckpt:
-            model.load_state_dict(ckpt["model"], strict=False)
-        else:
-            model.load_state_dict(ckpt, strict=False)
+        load_checkpoint(resume, model, strict=False)
 
     groups = param_groups_with_head_lrs(
         model,
@@ -56,7 +51,7 @@ def run_pretrain(
         weight_decay=cfg.training.weight_decay,
     )
     optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
-    scaler = GradScaler(enabled=cfg.training.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.amp and device.type == "cuda")
 
     out_dir = Path(cfg.training.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 
 from config.settings import FullConfig
 
@@ -39,7 +38,7 @@ def train_one_epoch(
         batch = _to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             loss, parts = model(
                 batch,
                 mask_ratio_focused=mm.mask_ratio_focused,

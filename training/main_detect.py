@@ -6,7 +6,6 @@ import warnings
 from pathlib import Path
 
 import torch
-from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
 from config import load_config
@@ -56,7 +55,7 @@ def run_detect(
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=det.lr, weight_decay=det.weight_decay)
-    scaler = GradScaler(enabled=det.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=det.amp and device.type == "cuda")
 
     out_dir = Path(cfg.training.output_dir) / "detect"
     out_dir.mkdir(parents=True, exist_ok=True)
