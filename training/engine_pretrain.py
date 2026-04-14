@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from config.settings import FullConfig
+from utils.wandb_utils import log_pretrain_step
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -23,9 +24,20 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     cfg: FullConfig,
-    scaler: GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
     epoch: int,
-) -> dict[str, float]:
+    global_step: int = 0,
+) -> tuple[dict[str, float], int]:
+    """
+    Run one full epoch of multi-encoder MAE pretraining.
+
+    Returns
+    -------
+    stats : dict
+        Epoch-averaged metrics: loss, loss_focused, loss_hybrid, loss_volume, epoch.
+    global_step : int
+        Updated optimizer step counter (for W&B x-axis alignment).
+    """
     model.train()
     total = 0.0
     n = 0
@@ -59,13 +71,19 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
             optimizer.step()
 
+        step_loss = float(loss.detach())
+        step_parts = {k: float(v) for k, v in parts.items()}
+        log_pretrain_step(global_step, step_loss, step_parts, cfg.wandb.log_freq)
+
         bs = batch["zstack"].shape[0]
-        total += float(loss.detach()) * bs
+        total += step_loss * bs
         n += bs
         for k in sums:
-            sums[k] += float(parts[k]) * bs
+            sums[k] += step_parts[k] * bs
+
+        global_step += 1
 
     out = {"loss": total / max(1, n), "epoch": float(epoch)}
     for k in sums:
         out[k] = sums[k] / max(1, n)
-    return out
+    return out, global_step

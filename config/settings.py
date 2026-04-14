@@ -216,21 +216,49 @@ class DetectionConfig:
 
 
 @dataclass
+class WandbConfig:
+    enabled: bool = False
+    project: str = "huang-lab-tissue-chip"
+    entity: Optional[str] = None        # W&B username or team name
+    run_name: Optional[str] = None      # auto-generated if None
+    tags: list = field(default_factory=list)
+    notes: str = ""
+    log_freq: int = 10                  # log step-level metrics every N steps
+    watch_model: bool = False           # wandb.watch() — shows gradient histograms
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> WandbConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            project=str(d.get("project", "huang-lab-tissue-chip")),
+            entity=d.get("entity") or None,
+            run_name=d.get("run_name") or None,
+            tags=list(d.get("tags", [])),
+            notes=str(d.get("notes", "")),
+            log_freq=int(d.get("log_freq", 10)),
+            watch_model=bool(d.get("watch_model", False)),
+        )
+
+
+@dataclass
 class FullConfig:
     dataset: DatasetConfig
     training: TrainingConfig
     pretrain: PretrainConfig
     multi_mae: MultiMAEConfig
     detection: DetectionConfig
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> FullConfig:
         mm = d.get("multi_mae") or {}
         det = d.get("detection") or {}
+        wb = d.get("wandb") or {}
         return cls(
             dataset=DatasetConfig.from_dict(d.get("dataset", {})),
             training=TrainingConfig.from_dict(d.get("training", {})),
             pretrain=PretrainConfig.from_dict(d.get("pretrain", {})),
             multi_mae=MultiMAEConfig.from_dict(mm),
             detection=DetectionConfig.from_dict(det),
+            wandb=WandbConfig.from_dict(wb),
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from config.settings import FullConfig
+from utils.wandb_utils import log_detect_step
 
 
 def train_one_epoch_detect(
@@ -12,7 +13,17 @@ def train_one_epoch_detect(
     device: torch.device,
     cfg: FullConfig,
     scaler: torch.amp.GradScaler | None,
-) -> float:
+    global_step: int = 0,
+) -> tuple[float, int]:
+    """
+    Run one epoch of Deformable-DETR detection training.
+
+    Returns
+    -------
+    mean_loss : float
+    global_step : int
+        Updated optimizer step counter.
+    """
     model.train()
     total, n = 0.0, 0
     use_amp = cfg.detection.amp and device.type == "cuda"
@@ -20,9 +31,10 @@ def train_one_epoch_detect(
     for batch in data_loader:
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         pixel_mask = batch["pixel_mask"].to(device, non_blocking=True)
-        labels: list[dict[str, torch.Tensor]] = []
-        for lab in batch["labels"]:
-            labels.append({k: v.to(device, non_blocking=True) for k, v in lab.items()})
+        labels: list[dict[str, torch.Tensor]] = [
+            {k: v.to(device, non_blocking=True) for k, v in lab.items()}
+            for lab in batch["labels"]
+        ]
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
@@ -37,7 +49,12 @@ def train_one_epoch_detect(
             loss.backward()
             optimizer.step()
 
+        step_loss = float(loss.detach())
+        log_detect_step(global_step, step_loss, cfg.wandb.log_freq)
+
         bs = pixel_values.shape[0]
-        total += float(loss.detach()) * bs
+        total += step_loss * bs
         n += bs
-    return total / max(1, n)
+        global_step += 1
+
+    return total / max(1, n), global_step

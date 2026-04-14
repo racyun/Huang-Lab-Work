@@ -4,6 +4,7 @@ import json
 import sys
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -12,12 +13,15 @@ from config import load_config
 from data.detection_dataset import build_detection_dataset, collate_detection_batch
 from training.engine_detect import train_one_epoch_detect
 from utils.checkpoint import save_checkpoint
+from utils.wandb_utils import finish_wandb, init_wandb, log_detect_epoch
 
 
 def run_detect(
     config_path: Path,
-    local_config: Path | None,
-    device_str: str | None,
+    local_config: Optional[Path],
+    device_str: Optional[str],
+    wandb_run_name: Optional[str] = None,
+    wandb_project: Optional[str] = None,
 ) -> None:
     try:
         from transformers import AutoModelForObjectDetection
@@ -27,6 +31,10 @@ def run_detect(
         ) from e
 
     cfg = load_config(config_path, local_config)
+
+    if wandb_project:
+        cfg.wandb.project = wandb_project
+
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     det = cfg.detection
 
@@ -60,12 +68,26 @@ def run_detect(
     out_dir = Path(cfg.training.output_dir) / "detect"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(det.epochs):
-        loss = train_one_epoch_detect(model, loader, optimizer, device, cfg, scaler)
-        row = {"epoch": epoch, "loss": loss}
-        print(json.dumps(row))
-        with open(out_dir / "detect_log.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+    # ── W&B init ──────────────────────────────────────────────────────────────
+    init_wandb(cfg, mode="detect", run_name_override=wandb_run_name)
+
+    global_step = 0
+
+    try:
+        for epoch in range(det.epochs):
+            epoch_loss, global_step = train_one_epoch_detect(
+                model, loader, optimizer, device, cfg, scaler, global_step
+            )
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            row = {"epoch": epoch, "loss": epoch_loss}
+            print(json.dumps(row))
+            with open(out_dir / "detect_log.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+
+            log_detect_epoch(epoch, epoch_loss, current_lr, global_step)
+    finally:
+        finish_wandb()
 
     save_checkpoint(out_dir / "detector_final.pth", model=model, optimizer=optimizer, epoch=det.epochs - 1)
     print("Detection training finished.", file=sys.stderr)

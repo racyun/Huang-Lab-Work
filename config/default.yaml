@@ -78,6 +78,16 @@ multi_mae:
   lr_mult_volume: 1.0
   lr_mult_stiffness: 1.0
 
+wandb:
+  enabled: false
+  project: "huang-lab-tissue-chip"
+  entity: null          # set to your W&B username or team in local.yaml
+  run_name: null        # auto-generated if null
+  tags: []
+  notes: ""
+  log_freq: 10          # log step-level metrics every N optimizer steps
+  watch_model: false    # log gradient histograms (slow for large models)
+
 detection:
   hf_model: "SenseTime/deformable-detr"
   num_classes: 2

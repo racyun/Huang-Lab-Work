@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
         help="Run full pretrain loop from config (epochs, dataloader, logging).",
     )
     p.add_argument("--mae-model", type=str, default="mae_vit_base_patch16", choices=list(MODEL_REGISTRY.keys()))
+    # W&B overrides (also settable via config/local.yaml wandb: section)
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb-project", type=str, default=None, help="W&B project name.")
+    p.add_argument("--wandb-run-name", type=str, default=None, help="W&B run display name.")
     return p.parse_args()
 
 
@@ -81,7 +85,16 @@ def main() -> None:
         return
 
     if args.train:
-        run_pretrain(args.config, args.local_config, args.resume, args.device)
+        if args.wandb:
+            cfg.wandb.enabled = True
+        run_pretrain(
+            args.config,
+            args.local_config,
+            args.resume,
+            args.device,
+            wandb_run_name=args.wandb_run_name,
+            wandb_project=args.wandb_project,
+        )
         return
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
