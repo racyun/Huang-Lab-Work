@@ -1,0 +1,106 @@
+# Copy to config/local.yaml (gitignored) and set paths. See config/local.yaml.example.
+
+dataset:
+  well_prefix: "W"
+  well_count: 222
+  zstack_subdir: "P00001"
+  expected_z_slices: 140
+  focus_filename_glob: "*focus_stacked*.tif"
+  hybrid_folder_template: "hybrid_results_{well_id}"
+  hybrid_filename_template: null   # set to e.g. "hybrid_comparison_{well_id}.png" for flat layouts
+  cache_dir: null
+  resize:
+    zstack: null
+    focused: null
+    hybrid: null
+
+  splits:
+    - name: "900kpa"
+      stiffness_kpa: 900.0
+      zstack_root: ""
+      focused_root: ""
+      hybrid_root: ""
+      labels_root: ""
+    - name: "5kpa"
+      stiffness_kpa: 5.0
+      zstack_root: ""
+      focused_root: ""
+      hybrid_root: ""
+      labels_root: ""
+
+training:
+  output_dir: "./outputs"
+  seed: 0
+  batch_size: 1
+  epochs: 2
+  num_workers: 0
+  lr: 0.00015
+  weight_decay: 0.05
+  warmup_epochs: 1
+  min_lr: 0.0
+  amp: true
+  grad_clip: null
+
+pretrain:
+  image_size: 224
+  mask_ratio: 0.75
+
+multi_mae:
+  image_size: 224
+  patch_xy_2d: 16
+  volume_z: 140
+  volume_h: 224
+  volume_w: 224
+  tublet_z: 4
+  volume_patch_xy: 16
+  in_chans: 3
+  embed_dim: 384
+  twod_depth: 4
+  twod_num_heads: 6
+  vol_depth: 4
+  vol_num_heads: 6
+  decoder_embed_dim: 384
+  twod_dec_depth: 2
+  twod_dec_num_heads: 8
+  vol_dec_depth: 2
+  vol_dec_num_heads: 8
+  norm_pix_loss: false
+  stiffness_hidden: 64
+  kpa_input_mode: "divide"
+  kpa_divisor: 900.0
+  loss_weight_focused: 1.0
+  loss_weight_hybrid: 1.0
+  loss_weight_volume: 1.0
+  mask_ratio_focused: 0.75
+  mask_ratio_hybrid: 0.75
+  mask_ratio_volume: 0.75
+  lr_mult_focused: 1.0
+  lr_mult_hybrid: 1.0
+  lr_mult_volume: 1.0
+  lr_mult_stiffness: 1.0
+
+wandb:
+  enabled: false
+  project: "huang-lab-tissue-chip"
+  entity: null          # set to your W&B username or team in local.yaml
+  run_name: null        # auto-generated if null
+  tags: []
+  notes: ""
+  log_freq: 10          # log step-level metrics every N optimizer steps
+  watch_model: false    # log gradient histograms (slow for large models)
+
+detection:
+  hf_model: "SenseTime/deformable-detr"
+  num_classes: 2
+  train_image_short_side: 800
+  max_train_samples: null
+  image_mode: "focused"
+  lr: 0.00002
+  weight_decay: 0.0001
+  epochs: 1
+  batch_size: 1
+  num_workers: 0
+  amp: true
+  mae_encoder_ckpt: null
+  mae_encoder_prefix: "mae_focused.encoder."
+  conf_threshold: 0.5   # minimum score to count a prediction as positive during eval
