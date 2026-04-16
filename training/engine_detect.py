@@ -7,6 +7,14 @@ from config.settings import FullConfig
 from utils.wandb_utils import log_detect_step
 
 
+def _has_faster_coco() -> bool:
+    try:
+        import faster_coco_eval  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def train_one_epoch_detect(
     model: torch.nn.Module,
     data_loader: torch.utils.data.DataLoader,
@@ -76,10 +84,21 @@ def eval_one_epoch_detect(
     try:
         from torchmetrics.detection import MeanAveragePrecision
     except ImportError:
-        raise SystemExit("Install torchmetrics: pip install torchmetrics")
+        raise SystemExit("Install torchmetrics: pip install torchmetrics[detection]")
 
-    metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+    # Use faster-coco-eval backend if available for ~10× speedup on CPU
+    _backend = "faster_coco_eval" if _has_faster_coco() else "pycocotools"
+    metric = MeanAveragePrecision(
+        box_format="xyxy",
+        iou_type="bbox",
+        backend=_backend,
+    )
     metric.to(device)
+
+    # Top-K per image: always keep best K predictions regardless of threshold,
+    # so mAP is non-zero even for untrained models. After training, confident
+    # predictions will naturally outscore random ones.
+    TOP_K = 50
 
     model.eval()
     all_ious: list[float] = []
@@ -103,25 +122,26 @@ def eval_one_epoch_detect(
             targets_list = []
 
             for i in range(B):
-                scores, class_ids = pred_logits[i].softmax(-1).max(-1)  # [Q]
-
-                # Filter out background (last class index) and low-confidence preds
                 num_classes = pred_logits.shape[-1]
-                keep = (scores > conf_threshold) & (class_ids < num_classes - 1)
+                probs = pred_logits[i].softmax(-1)            # [Q, C]
+                scores, class_ids = probs.max(-1)             # [Q]
 
-                boxes_cxcywh = pred_boxes_norm[i][keep]  # [K, 4]
+                # Remove background class (last index), then keep top-K by score
+                fg_mask = class_ids < (num_classes - 1)
+                fg_scores = scores * fg_mask.float()
+                k = min(TOP_K, int(fg_mask.sum().item()) or 1)
+                topk_idx = fg_scores.topk(k).indices
+
+                boxes_cxcywh = pred_boxes_norm[i][topk_idx]  # [K, 4]
                 # Convert cxcywh normalised → xyxy pixel
-                if boxes_cxcywh.numel() > 0:
-                    boxes_xyxy = box_convert(boxes_cxcywh, "cxcywh", "xyxy")
-                    boxes_xyxy[:, [0, 2]] *= img_w
-                    boxes_xyxy[:, [1, 3]] *= img_h
-                else:
-                    boxes_xyxy = torch.zeros((0, 4), device=device)
+                boxes_xyxy = box_convert(boxes_cxcywh, "cxcywh", "xyxy")
+                boxes_xyxy[:, [0, 2]] *= img_w
+                boxes_xyxy[:, [1, 3]] *= img_h
 
                 preds_list.append({
                     "boxes": boxes_xyxy,
-                    "scores": scores[keep],
-                    "labels": class_ids[keep],
+                    "scores": scores[topk_idx],
+                    "labels": class_ids[topk_idx],
                 })
 
                 # Ground-truth: cxcywh normalised → xyxy pixel
