@@ -14,8 +14,8 @@ accelerate>=0.25.0
 wandb>=0.16.0
 
 # Detection metrics
-torchmetrics>=1.0.0
-scipy>=1.10.0          # required by Deformable-DETR Hungarian matcher
+torchmetrics[detection]>=1.0.0   # includes pycocotools dependency
+scipy>=1.10.0                    # required by Deformable-DETR Hungarian matcher
 
 # Testing
 pytest>=7.0

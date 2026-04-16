@@ -64,9 +64,16 @@ class TissueChipDetectionDataset(Dataset):
 
 
 def build_detection_dataset(cfg: FullConfig) -> TissueChipDetectionDataset:
+    from pathlib import Path
+    from data.cache import CachedTissueChipDataset, default_cache_key
     from data.combined import build_tissue_chip_dataset
 
     base = build_tissue_chip_dataset(cfg.dataset)
+    if cfg.dataset.cache_dir:
+        # Use a separate "detect" subdirectory so boxes are included in cached samples
+        # (pretrain cache omits boxes since TissueChipPretrainDataset doesn't need them)
+        detect_cache_dir = Path(cfg.dataset.cache_dir) / "detect"
+        base = CachedTissueChipDataset(base, detect_cache_dir, default_cache_key)
     return TissueChipDetectionDataset(base, cfg.detection)
 
 
