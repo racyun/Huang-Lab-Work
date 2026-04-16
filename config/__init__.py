@@ -16,9 +16,21 @@ from config.settings import (
 )
 
 
+def _expand_paths(obj: Any) -> Any:
+    """Recursively expand ~ and env vars in any string values in a nested dict."""
+    if isinstance(obj, dict):
+        return {k: _expand_paths(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_paths(v) for v in obj]
+    if isinstance(obj, str) and ("~" in obj or "$" in obj):
+        return str(Path(obj).expanduser())
+    return obj
+
+
 def load_yaml(path: Path) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        raw = yaml.safe_load(f) or {}
+    return _expand_paths(raw)
 
 
 def merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

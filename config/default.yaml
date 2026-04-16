@@ -7,6 +7,7 @@ dataset:
   expected_z_slices: 140
   focus_filename_glob: "*focus_stacked*.tif"
   hybrid_folder_template: "hybrid_results_{well_id}"
+  hybrid_filename_template: null   # set to e.g. "hybrid_comparison_{well_id}.png" for flat layouts
   cache_dir: null
   resize:
     zstack: null

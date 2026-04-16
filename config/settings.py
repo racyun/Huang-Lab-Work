@@ -33,6 +33,7 @@ class DatasetConfig:
     expected_z_slices: Optional[int] = 140
     focus_filename_glob: str = "*focus_stacked*.tif"
     hybrid_folder_template: str = "hybrid_results_{well_id}"
+    hybrid_filename_template: Optional[str] = None  # e.g. "hybrid_comparison_{well_id}.png" for flat layouts
     resize: dict[str, Optional[list[int]]] = field(
         default_factory=lambda: {"zstack": None, "focused": None, "hybrid": None}
     )
@@ -52,6 +53,7 @@ class DatasetConfig:
             ),
             focus_filename_glob=str(d.get("focus_filename_glob", "*focus_stacked*.tif")),
             hybrid_folder_template=str(d.get("hybrid_folder_template", "hybrid_results_{well_id}")),
+            hybrid_filename_template=d.get("hybrid_filename_template") or None,
             resize={
                 "zstack": resize.get("zstack"),
                 "focused": resize.get("focused"),

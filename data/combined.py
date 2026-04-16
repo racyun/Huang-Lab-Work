@@ -134,7 +134,7 @@ def build_tissue_chip_dataset(cfg: DatasetConfig) -> TissueChipDataset:
         focus_map = discover_focus_paths(Path(split.focused_root), cfg.focus_filename_glob)
         z_ds = ZStackModalDataset(split, wells, cfg.zstack_subdir, cfg.expected_z_slices, rz)
         f_ds = FocusedModalDataset(split, wells, focus_map, rf)
-        h_ds = HybridModalDataset(split, wells, cfg.hybrid_folder_template, rh)
+        h_ds = HybridModalDataset(split, wells, cfg.hybrid_folder_template, rh, cfg.hybrid_filename_template)
         bundles.append(
             _SplitBundle(
                 split_name=split.name,

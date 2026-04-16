@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 
 from config.settings import SplitConfig
 
-IMG_EXTS = {".tif", ".tiff"}
+IMG_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
 
 def _pil_to_chw_float(img: Image.Image) -> torch.Tensor:
@@ -119,11 +119,13 @@ class HybridModalDataset(Dataset):
         well_ids: list[str],
         hybrid_folder_template: str,
         resize_hw: Optional[tuple[int, int]] = None,
+        hybrid_filename_template: Optional[str] = None,
     ):
         self.root = Path(split.hybrid_root)
         self.stiffness = float(split.stiffness_kpa)
         self.well_ids = list(well_ids)
         self.hybrid_folder_template = hybrid_folder_template
+        self.hybrid_filename_template = hybrid_filename_template
         self.resize_hw = resize_hw
 
     def __len__(self) -> int:
@@ -131,11 +133,18 @@ class HybridModalDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
         well_id = self.well_ids[idx]
-        folder = self.root / self.hybrid_folder_template.format(well_id=well_id)
-        paths = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
-        if not paths:
-            raise FileNotFoundError(f"No hybrid image in {folder}")
-        p = paths[0]
+        if self.hybrid_filename_template:
+            # Flat layout: one file per well directly in hybrid_root
+            p = self.root / self.hybrid_filename_template.format(well_id=well_id)
+            if not p.is_file():
+                raise FileNotFoundError(f"Hybrid image not found: {p}")
+        else:
+            # Subfolder layout: hybrid_root/hybrid_results_W001/<image>
+            folder = self.root / self.hybrid_folder_template.format(well_id=well_id)
+            paths = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
+            if not paths:
+                raise FileNotFoundError(f"No hybrid image in {folder}")
+            p = paths[0]
         with Image.open(p) as im:
             t = _pil_to_chw_float(im)
         t = _maybe_resize_chw(t, self.resize_hw)
