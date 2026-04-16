@@ -52,8 +52,6 @@ def run_pretrain(
     )
 
     model = build_multi_encoder_mae(cfg.multi_mae).to(device)
-    if resume is not None:
-        load_checkpoint(resume, model, strict=False)
 
     groups = param_groups_with_head_lrs(
         model,
@@ -67,6 +65,15 @@ def run_pretrain(
     optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.amp and device.type == "cuda")
 
+    start_epoch = 0
+    global_step = 0
+    if resume is not None:
+        ckpt = load_checkpoint(resume, model, optimizer=optimizer, strict=False)
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        global_step = int(ckpt.get("global_step", 0))
+        print(f"Resumed from {resume} — starting at epoch {start_epoch}, step {global_step}",
+              file=sys.stderr)
+
     out_dir = Path(cfg.training.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,10 +82,8 @@ def run_pretrain(
     if cfg.wandb.watch_model:
         watch_model(model, log_freq=cfg.wandb.log_freq * 10)
 
-    global_step = 0
-
     try:
-        for epoch in range(cfg.training.epochs):
+        for epoch in range(start_epoch, cfg.training.epochs):
             set_epoch_learning_rates(
                 optimizer,
                 epoch,
@@ -100,13 +105,15 @@ def run_pretrain(
             # W&B epoch log
             log_pretrain_epoch(epoch, stats, optimizer, global_step)
 
-            if (epoch + 1) % max(1, cfg.training.epochs // 10) == 0 or epoch + 1 == cfg.training.epochs:
+            # Save every epoch for the first 5 epochs, then every epochs//10
+            save_every = max(1, cfg.training.epochs // 10)
+            if epoch < 5 or (epoch + 1) % save_every == 0 or epoch + 1 == cfg.training.epochs:
                 save_checkpoint(
                     out_dir / f"multimae_epoch_{epoch+1}.pth",
                     model=model,
                     optimizer=optimizer,
                     epoch=epoch,
-                    extra={"config": str(config_path)},
+                    extra={"config": str(config_path), "global_step": global_step},
                 )
     finally:
         finish_wandb()

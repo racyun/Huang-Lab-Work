@@ -198,6 +198,7 @@ class DetectionConfig:
     mae_encoder_ckpt: Optional[str] = None
     mae_encoder_prefix: str = "mae_focused.encoder."
     conf_threshold: float = 0.5  # confidence threshold for eval predictions
+    resume_ckpt: Optional[str] = None  # path to a detector checkpoint to resume from
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DetectionConfig:
@@ -216,6 +217,7 @@ class DetectionConfig:
             mae_encoder_ckpt=d.get("mae_encoder_ckpt"),
             mae_encoder_prefix=str(d.get("mae_encoder_prefix", "mae_focused.encoder.")),
             conf_threshold=float(d.get("conf_threshold", 0.5)),
+            resume_ckpt=d.get("resume_ckpt") or None,
         )
 
 

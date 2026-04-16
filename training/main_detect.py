@@ -71,12 +71,19 @@ def run_detect(
     # ── W&B init ──────────────────────────────────────────────────────────────
     init_wandb(cfg, mode="detect", run_name_override=wandb_run_name)
 
+    start_epoch = 0
     global_step = 0
+    if det.resume_ckpt:
+        from utils.checkpoint import load_checkpoint
+        ckpt = load_checkpoint(Path(det.resume_ckpt), model, optimizer)
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        global_step = int(ckpt.get("global_step", 0))
+        print(f"Resumed from {det.resume_ckpt} — starting at epoch {start_epoch}", file=sys.stderr)
 
     conf_threshold = getattr(det, "conf_threshold", 0.5)
 
     try:
-        for epoch in range(det.epochs):
+        for epoch in range(start_epoch, det.epochs):
             epoch_loss, global_step = train_one_epoch_detect(
                 model, loader, optimizer, device, cfg, scaler, global_step
             )
@@ -92,6 +99,15 @@ def run_detect(
 
             log_detect_epoch(epoch, epoch_loss, current_lr, global_step)
             log_detect_eval(epoch, eval_metrics, global_step)
+
+            # Save every epoch for first 5, then every epochs//10
+            save_every = max(1, det.epochs // 10)
+            if epoch < 5 or (epoch + 1) % save_every == 0 or epoch + 1 == det.epochs:
+                save_checkpoint(
+                    out_dir / f"detector_epoch_{epoch+1}.pth",
+                    model=model, optimizer=optimizer, epoch=epoch,
+                    extra={"global_step": global_step},
+                )
     finally:
         finish_wandb()
 
