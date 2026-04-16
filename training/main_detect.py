@@ -11,9 +11,9 @@ from torch.utils.data import DataLoader
 
 from config import load_config
 from data.detection_dataset import build_detection_dataset, collate_detection_batch
-from training.engine_detect import train_one_epoch_detect
+from training.engine_detect import eval_one_epoch_detect, train_one_epoch_detect
 from utils.checkpoint import save_checkpoint
-from utils.wandb_utils import finish_wandb, init_wandb, log_detect_epoch
+from utils.wandb_utils import finish_wandb, init_wandb, log_detect_epoch, log_detect_eval
 
 
 def run_detect(
@@ -73,6 +73,8 @@ def run_detect(
 
     global_step = 0
 
+    conf_threshold = getattr(det, "conf_threshold", 0.5)
+
     try:
         for epoch in range(det.epochs):
             epoch_loss, global_step = train_one_epoch_detect(
@@ -80,12 +82,16 @@ def run_detect(
             )
             current_lr = optimizer.param_groups[0]["lr"]
 
-            row = {"epoch": epoch, "loss": epoch_loss}
+            # ── Evaluation ────────────────────────────────────────────────────
+            eval_metrics = eval_one_epoch_detect(model, loader, device, conf_threshold)
+
+            row = {"epoch": epoch, "loss": epoch_loss, **eval_metrics}
             print(json.dumps(row))
             with open(out_dir / "detect_log.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
 
             log_detect_epoch(epoch, epoch_loss, current_lr, global_step)
+            log_detect_eval(epoch, eval_metrics, global_step)
     finally:
         finish_wandb()
 

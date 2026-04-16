@@ -103,3 +103,4 @@ detection:
   amp: true
   mae_encoder_ckpt: null
   mae_encoder_prefix: "mae_focused.encoder."
+  conf_threshold: 0.5   # minimum score to count a prediction as positive during eval

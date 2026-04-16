@@ -13,5 +13,9 @@ accelerate>=0.25.0
 # Experiment tracking
 wandb>=0.16.0
 
+# Detection metrics
+torchmetrics>=1.0.0
+scipy>=1.10.0          # required by Deformable-DETR Hungarian matcher
+
 # Testing
 pytest>=7.0

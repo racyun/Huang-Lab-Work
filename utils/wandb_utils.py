@@ -157,6 +157,14 @@ def log_detect_epoch(epoch: int, loss: float, lr: float, step: int) -> None:
     )
 
 
+def log_detect_eval(epoch: int, metrics: dict[str, float], step: int) -> None:
+    """Log per-epoch detection evaluation metrics (mAP, IoU, etc.)."""
+    log_metrics(
+        {f"eval/{k}": v for k, v in metrics.items()} | {"epoch": epoch},
+        step=step,
+    )
+
+
 def finish_wandb() -> None:
     """Mark the active W&B run as finished. No-op if not running."""
     wb = _wandb()
