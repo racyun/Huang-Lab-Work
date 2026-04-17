@@ -13,7 +13,7 @@ from config import load_config
 from data.detection_dataset import build_detection_dataset, collate_detection_batch
 from training.engine_detect import eval_one_epoch_detect, train_one_epoch_detect
 from utils.checkpoint import save_checkpoint
-from utils.wandb_utils import finish_wandb, init_wandb, log_detect_epoch, log_detect_eval
+from utils.wandb_utils import finish_wandb, init_wandb, log_detect_combined
 
 
 def run_detect(
@@ -97,8 +97,8 @@ def run_detect(
             with open(out_dir / "detect_log.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
 
-            log_detect_epoch(epoch, epoch_loss, current_lr, global_step)
-            log_detect_eval(epoch, eval_metrics, global_step)
+            # Single W&B call so all metrics share the same step point
+            log_detect_combined(epoch, epoch_loss, current_lr, eval_metrics, global_step)
 
             # Save every epoch for first 5, then every epochs//10
             save_every = max(1, det.epochs // 10)

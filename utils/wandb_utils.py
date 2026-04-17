@@ -165,6 +165,33 @@ def log_detect_eval(epoch: int, metrics: dict[str, float], step: int) -> None:
     )
 
 
+def log_detect_combined(
+    epoch: int,
+    loss: float,
+    lr: float,
+    eval_metrics: dict[str, float],
+    step: int,
+) -> None:
+    """Log all per-epoch detection metrics in a single W&B call.
+
+    Merging into one call ensures loss, LR, and eval metrics (AP50, mAP,
+    mean_iou) all appear on the same x-axis point in W&B, giving clean
+    curves when plotted against epoch or step.
+    """
+    log_metrics(
+        {
+            "detect/loss": loss,
+            "detect/lr": lr,
+            "eval/AP50": eval_metrics.get("AP50", 0.0),
+            "eval/mAP": eval_metrics.get("mAP", 0.0),
+            "eval/AP75": eval_metrics.get("AP75", 0.0),
+            "eval/mean_iou": eval_metrics.get("mean_iou", 0.0),
+            "epoch": epoch,
+        },
+        step=step,
+    )
+
+
 def finish_wandb() -> None:
     """Mark the active W&B run as finished. No-op if not running."""
     wb = _wandb()
