@@ -65,6 +65,23 @@ def init_wandb(
     config_dict = _flatten_config(cfg)
 
     try:
+        import os
+        # Explicitly login inside the subprocess using the env var key.
+        # This is required because !python3 subprocesses don't inherit the
+        # parent Jupyter kernel's wandb.login() state — only the env var.
+        api_key = os.environ.get("WANDB_API_KEY")
+        if api_key:
+            login_result = wb.login(key=api_key, relogin=True)
+            if not login_result:
+                raise RuntimeError(
+                    "wandb.login() returned False — API key is invalid or expired. "
+                    "Go to https://wandb.ai/authorize, copy a fresh key, and re-run Cell 8."
+                )
+        else:
+            raise RuntimeError(
+                "WANDB_API_KEY env var is not set. Re-run Cell 8 to log in."
+            )
+
         run = wb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity or None,
@@ -72,7 +89,7 @@ def init_wandb(
             tags=list(cfg.wandb.tags) + [mode],
             notes=cfg.wandb.notes or None,
             config=config_dict,
-            reinit=True,
+            reinit="finish_previous",
         )
         return run
     except Exception as e:
