@@ -64,16 +64,22 @@ def init_wandb(
     # Flatten FullConfig to a plain dict for W&B config panel
     config_dict = _flatten_config(cfg)
 
-    run = wb.init(
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity or None,
-        name=run_name,
-        tags=list(cfg.wandb.tags) + [mode],
-        notes=cfg.wandb.notes or None,
-        config=config_dict,
-        reinit=True,
-    )
-    return run
+    try:
+        run = wb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity or None,
+            name=run_name,
+            tags=list(cfg.wandb.tags) + [mode],
+            notes=cfg.wandb.notes or None,
+            config=config_dict,
+            reinit=True,
+        )
+        return run
+    except Exception as e:
+        print(f"[wandb] WARNING: Could not initialise W&B run ({e}). "
+              "Training will continue without W&B logging.", flush=True)
+        cfg.wandb.enabled = False
+        return None
 
 
 def watch_model(model: Any, log_freq: int = 100) -> None:
