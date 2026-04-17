@@ -22,6 +22,7 @@ def run_detect(
     device_str: Optional[str],
     wandb_run_name: Optional[str] = None,
     wandb_project: Optional[str] = None,
+    wandb_enabled: bool = False,
 ) -> None:
     try:
         from transformers import AutoModelForObjectDetection
@@ -32,6 +33,8 @@ def run_detect(
 
     cfg = load_config(config_path, local_config)
 
+    if wandb_enabled:
+        cfg.wandb.enabled = True
     if wandb_project:
         cfg.wandb.project = wandb_project
 

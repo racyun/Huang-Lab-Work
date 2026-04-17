@@ -31,17 +31,13 @@ def main() -> None:
     setup_logging()
     args = parse_args()
 
-    if args.wandb:
-        from config import load_config
-        cfg = load_config(args.config, args.local_config)
-        cfg.wandb.enabled = True
-
     run_detect(
         args.config,
         args.local_config,
         args.device,
         wandb_run_name=args.wandb_run_name,
         wandb_project=args.wandb_project,
+        wandb_enabled=args.wandb,
     )
 
 
