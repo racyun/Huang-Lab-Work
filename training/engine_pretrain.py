@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
 
 from config.settings import FullConfig
 from utils.wandb_utils import log_pretrain_step
+
+
+# Console step-loss print every N steps, independent of W&B log_freq.
+# Lets you see the run is alive even if W&B isn't logging yet.
+_STDOUT_LOG_EVERY = 10
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -46,7 +52,15 @@ def train_one_epoch(
     use_amp = cfg.training.amp and device.type == "cuda"
     mm = cfg.multi_mae
 
-    for batch in data_loader:
+    n_steps = len(data_loader)
+    t_step = time.time()
+    print(f"[engine] epoch {epoch} loop started — {n_steps} steps; first batch may take 30–60s "
+          f"(Drive read + cache write)", flush=True)
+
+    for step_in_epoch, batch in enumerate(data_loader):
+        if step_in_epoch == 0:
+            dt_first = time.time() - t_step
+            print(f"[engine] first batch loaded in {dt_first:.1f}s", flush=True)
         batch = _to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
@@ -74,6 +88,15 @@ def train_one_epoch(
         step_loss = float(loss.detach())
         step_parts = {k: float(v) for k, v in parts.items()}
         log_pretrain_step(global_step, step_loss, step_parts, cfg.wandb.log_freq)
+
+        # Stdout heartbeat: shows the loop is alive even if W&B hasn't flushed.
+        if global_step % _STDOUT_LOG_EVERY == 0:
+            dt = time.time() - t_step
+            print(f"[{time.strftime('%H:%M:%S')}] "
+                  f"epoch {epoch} step {step_in_epoch+1}/{n_steps} "
+                  f"global_step={global_step} loss={step_loss:.4f} "
+                  f"({dt:.1f}s since last)", flush=True)
+            t_step = time.time()
 
         bs = batch["zstack"].shape[0]
         total += step_loss * bs

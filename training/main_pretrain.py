@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,11 @@ from utils.wandb_utils import (
 )
 
 
+def _log(msg: str) -> None:
+    """Timestamped heartbeat print so users see progress during long startup phases."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def run_pretrain(
     config_path: Path,
     local_config: Optional[Path],
@@ -31,6 +37,7 @@ def run_pretrain(
     wandb_run_name: Optional[str] = None,
     wandb_project: Optional[str] = None,
 ) -> None:
+    _log("Loading config...")
     cfg = load_config(config_path, local_config)
 
     # Allow CLI overrides for W&B settings
@@ -39,8 +46,13 @@ def run_pretrain(
 
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(cfg.training.seed)
+    _log(f"Device: {device}  |  batch_size={cfg.training.batch_size}  num_workers={cfg.training.num_workers}")
 
+    _log("Building pretrain dataset (scanning wells/files)... this can take a few min on first run")
+    t0 = time.time()
     ds = build_pretrain_dataset(cfg)
+    _log(f"Dataset built: {len(ds)} samples in {time.time() - t0:.1f}s")
+
     loader = DataLoader(
         ds,
         batch_size=cfg.training.batch_size,
@@ -50,8 +62,12 @@ def run_pretrain(
         collate_fn=pretrain_collate,
         drop_last=True,
     )
+    _log(f"DataLoader ready: {len(loader)} steps/epoch")
 
+    _log("Building model and moving to device...")
+    t0 = time.time()
     model = build_multi_encoder_mae(cfg.multi_mae).to(device)
+    _log(f"Model built in {time.time() - t0:.1f}s")
 
     groups = param_groups_with_head_lrs(
         model,
@@ -78,9 +94,11 @@ def run_pretrain(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── W&B init ──────────────────────────────────────────────────────────────
+    _log("Initialising W&B...")
     init_wandb(cfg, mode="pretrain", run_name_override=wandb_run_name)
     if cfg.wandb.watch_model:
         watch_model(model, log_freq=cfg.wandb.log_freq * 10)
+    _log("W&B ready. Entering training loop.")
 
     try:
         for epoch in range(start_epoch, cfg.training.epochs):
@@ -93,9 +111,12 @@ def run_pretrain(
                 peak_lr=cfg.training.lr,
             )
 
+            _log(f"=== Epoch {epoch+1}/{cfg.training.epochs} starting ===")
+            t_epoch = time.time()
             stats, global_step = train_one_epoch(
                 model, loader, optimizer, device, cfg, scaler, epoch, global_step
             )
+            _log(f"=== Epoch {epoch+1} done in {time.time() - t_epoch:.1f}s, loss={stats['loss']:.4f} ===")
 
             # Console + JSONL log
             print(json.dumps({"train": stats}, indent=2))
