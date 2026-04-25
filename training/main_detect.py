@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,11 @@ from data.detection_dataset import build_detection_dataset, collate_detection_ba
 from training.engine_detect import eval_one_epoch_detect, train_one_epoch_detect
 from utils.checkpoint import save_checkpoint
 from utils.wandb_utils import finish_wandb, init_wandb, log_detect_combined
+
+
+def _log(msg: str) -> None:
+    """Timestamped heartbeat print so users see progress during long startup phases."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def run_detect(
@@ -31,6 +37,7 @@ def run_detect(
             "Install transformers for detection: pip install transformers accelerate"
         ) from e
 
+    _log("Loading config...")
     cfg = load_config(config_path, local_config)
 
     if wandb_enabled:
@@ -40,6 +47,7 @@ def run_detect(
 
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     det = cfg.detection
+    _log(f"Device: {device}  |  batch_size={det.batch_size}  num_workers={det.num_workers}  epochs={det.epochs}")
 
     if det.mae_encoder_ckpt:
         warnings.warn(
@@ -49,13 +57,20 @@ def run_detect(
             stacklevel=1,
         )
 
+    _log(f"Loading detection model from HuggingFace: {det.hf_model} (downloads ~150 MB on first run)...")
+    t0 = time.time()
     model = AutoModelForObjectDetection.from_pretrained(
         det.hf_model,
         num_labels=det.num_classes,
         ignore_mismatched_sizes=True,
     ).to(device)
+    _log(f"Model loaded in {time.time() - t0:.1f}s")
 
+    _log("Building detection dataset (scanning wells/files; uses 'detect' cache subdir)...")
+    t0 = time.time()
     ds = build_detection_dataset(cfg)
+    _log(f"Dataset built: {len(ds)} samples in {time.time() - t0:.1f}s")
+
     loader = DataLoader(
         ds,
         batch_size=det.batch_size,
@@ -64,6 +79,7 @@ def run_detect(
         collate_fn=collate_detection_batch,
         pin_memory=device.type == "cuda",
     )
+    _log(f"DataLoader ready: {len(loader)} steps/epoch")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=det.lr, weight_decay=det.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=det.amp and device.type == "cuda")
@@ -72,7 +88,9 @@ def run_detect(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── W&B init ──────────────────────────────────────────────────────────────
+    _log("Initialising W&B...")
     init_wandb(cfg, mode="detect", run_name_override=wandb_run_name)
+    _log("W&B ready.")
 
     start_epoch = 0
     global_step = 0
@@ -87,16 +105,23 @@ def run_detect(
 
     try:
         for epoch in range(start_epoch, det.epochs):
+            _log(f"=== Epoch {epoch+1}/{det.epochs} starting (train) ===")
+            t_epoch = time.time()
             epoch_loss, global_step = train_one_epoch_detect(
                 model, loader, optimizer, device, cfg, scaler, global_step
             )
+            _log(f"=== Epoch {epoch+1} train done in {time.time() - t_epoch:.1f}s, loss={epoch_loss:.4f} ===")
             current_lr = optimizer.param_groups[0]["lr"]
 
             # ── Evaluation ────────────────────────────────────────────────────
+            _log(f"--- Epoch {epoch+1} eval starting ---")
+            t_eval = time.time()
             eval_metrics = eval_one_epoch_detect(model, loader, device, conf_threshold)
+            _log(f"--- Epoch {epoch+1} eval done in {time.time() - t_eval:.1f}s "
+                 f"AP50={eval_metrics.get('AP50', 0):.4f} mAP={eval_metrics.get('mAP', 0):.4f} ---")
 
             row = {"epoch": epoch, "loss": epoch_loss, **eval_metrics}
-            print(json.dumps(row))
+            print(json.dumps(row), flush=True)
             with open(out_dir / "detect_log.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
 

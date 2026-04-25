@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import time
+
 import torch
 from torchvision.ops import box_convert, box_iou
 
 from config.settings import FullConfig
 from utils.wandb_utils import log_detect_step
+
+
+# Console step heartbeat every N steps, independent of W&B log_freq.
+_STDOUT_LOG_EVERY = 10
 
 
 def _has_faster_coco() -> bool:
@@ -37,7 +43,13 @@ def train_one_epoch_detect(
     total, n = 0.0, 0
     use_amp = cfg.detection.amp and device.type == "cuda"
 
-    for batch in data_loader:
+    n_steps = len(data_loader)
+    t_step = time.time()
+    print(f"[engine] detect train loop started — {n_steps} steps; first batch may be slow on cold cache", flush=True)
+
+    for step_in_epoch, batch in enumerate(data_loader):
+        if step_in_epoch == 0:
+            print(f"[engine] first batch loaded in {time.time() - t_step:.1f}s", flush=True)
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         pixel_mask = batch["pixel_mask"].to(device, non_blocking=True)
         labels: list[dict[str, torch.Tensor]] = [
@@ -60,6 +72,14 @@ def train_one_epoch_detect(
 
         step_loss = float(loss.detach())
         log_detect_step(global_step, step_loss, cfg.wandb.log_freq)
+
+        if global_step % _STDOUT_LOG_EVERY == 0:
+            dt = time.time() - t_step
+            print(f"[{time.strftime('%H:%M:%S')}] "
+                  f"detect step {step_in_epoch+1}/{n_steps} "
+                  f"global_step={global_step} loss={step_loss:.4f} "
+                  f"({dt:.1f}s since last)", flush=True)
+            t_step = time.time()
 
         bs = pixel_values.shape[0]
         total += step_loss * bs
