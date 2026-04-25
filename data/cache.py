@@ -40,29 +40,45 @@ class DiskTensorCache:
 
 
 class CachedTissueChipDataset(Dataset):
-    """Caches ``__getitem__`` dicts (tensors + small metadata strings) to ``.pt`` files."""
+    """Caches ``__getitem__`` dicts (tensors + small metadata strings) to ``.pt`` files.
+
+    If ``key_from_idx`` is provided, the cache is checked **before** the inner
+    dataset is touched, so a cache hit avoids the (potentially very slow) inner
+    load entirely. Without it, the cache only avoids re-running post-processing —
+    the inner load still runs every time.
+    """
 
     def __init__(
         self,
         inner: Dataset,
         cache_dir: Path,
         key_from_sample: Callable[[dict[str, Any]], str],
+        key_from_idx: Optional[Callable[[int], str]] = None,
     ):
         self.inner = inner
         self.cache = DiskTensorCache(cache_dir)
         self.key_from_sample = key_from_sample
+        self.key_from_idx = key_from_idx
 
     def __len__(self) -> int:
         return len(self.inner)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        raw = self.inner[idx]
-
-        def factory() -> dict[str, Any]:
+        # Fast path: cache hit without touching the inner dataset.
+        if self.key_from_idx is not None:
+            key = self.key_from_idx(idx)
+            cache_path = self.cache.path(key)
+            if cache_path.is_file():
+                return _torch_load(cache_path)
+            # Cache miss: fall through to load + write below.
+            raw = self.inner[idx]
+            torch.save(raw, cache_path)
             return raw
 
+        # Legacy slow path: always loads from inner, only saves post-processing.
+        raw = self.inner[idx]
         key = self.key_from_sample(raw)
-        return self.cache.get(key, factory)
+        return self.cache.get(key, lambda: raw)
 
 
 def default_cache_key(sample: dict[str, Any]) -> str:

@@ -65,7 +65,7 @@ class TissueChipDetectionDataset(Dataset):
 
 def build_detection_dataset(cfg: FullConfig) -> TissueChipDetectionDataset:
     from pathlib import Path
-    from data.cache import CachedTissueChipDataset, default_cache_key
+    from data.cache import CachedTissueChipDataset, _safe_key, default_cache_key
     from data.combined import build_tissue_chip_dataset
 
     base = build_tissue_chip_dataset(cfg.dataset)
@@ -73,7 +73,20 @@ def build_detection_dataset(cfg: FullConfig) -> TissueChipDetectionDataset:
         # Use a separate "detect" subdirectory so boxes are included in cached samples
         # (pretrain cache omits boxes since TissueChipPretrainDataset doesn't need them)
         detect_cache_dir = Path(cfg.dataset.cache_dir) / "detect"
-        base = CachedTissueChipDataset(base, detect_cache_dir, default_cache_key)
+
+        # Precompute (split, well_id) per idx so cache hits avoid Drive reads.
+        idx_to_key: list[str] = []
+        for sub in base._concat.datasets:  # _JoinedSplitDataset list
+            split_name = sub.bundle.split_name
+            for wid in sub.bundle.well_ids:
+                idx_to_key.append(_safe_key(split_name, wid))
+
+        base = CachedTissueChipDataset(
+            base,
+            detect_cache_dir,
+            default_cache_key,
+            key_from_idx=lambda i, _k=idx_to_key: _k[i],
+        )
     return TissueChipDetectionDataset(base, cfg.detection)
 
 

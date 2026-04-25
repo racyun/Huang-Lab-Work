@@ -64,11 +64,26 @@ class TissueChipPretrainDataset(Dataset):
 def build_pretrain_dataset(cfg: FullConfig) -> Dataset:
     from pathlib import Path
 
-    from data.cache import CachedTissueChipDataset, default_cache_key
+    from data.cache import CachedTissueChipDataset, _safe_key, default_cache_key
     from data.combined import build_tissue_chip_dataset
 
     chip = build_tissue_chip_dataset(cfg.dataset)
     ds: Dataset = TissueChipPretrainDataset(chip, cfg.multi_mae)
+
     if cfg.dataset.cache_dir:
-        ds = CachedTissueChipDataset(ds, Path(cfg.dataset.cache_dir), default_cache_key)
+        # Precompute (split, well_id) per global idx so the cache can be
+        # checked WITHOUT loading the inner sample first. Without this,
+        # every batch still reads ~140 TIFFs/well from Drive even on a hit.
+        idx_to_key: list[str] = []
+        for sub in chip._concat.datasets:  # _JoinedSplitDataset list
+            split_name = sub.bundle.split_name
+            for wid in sub.bundle.well_ids:
+                idx_to_key.append(_safe_key(split_name, wid))
+
+        ds = CachedTissueChipDataset(
+            ds,
+            Path(cfg.dataset.cache_dir),
+            default_cache_key,
+            key_from_idx=lambda i, _k=idx_to_key: _k[i],
+        )
     return ds
