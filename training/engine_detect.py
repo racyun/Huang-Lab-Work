@@ -143,16 +143,22 @@ def eval_one_epoch_detect(
 
             for i in range(B):
                 num_classes = pred_logits.shape[-1]
-                probs = pred_logits[i].softmax(-1)            # [Q, C]
-                scores, class_ids = probs.max(-1)             # [Q]
 
-                # Remove background class (last index), then keep top-K by score
-                fg_mask = class_ids < (num_classes - 1)
-                fg_scores = scores * fg_mask.float()
-                k = min(TOP_K, int(fg_mask.sum().item()) or 1)
-                topk_idx = fg_scores.topk(k).indices
+                # HuggingFace Deformable-DETR uses SIGMOID focal loss, not
+                # softmax — every class is foreground (no implicit background
+                # slot). Standard post-processing: sigmoid each (query, class)
+                # logit independently, then take top-K over the flattened
+                # (Q*C) score matrix. A single query can contribute multiple
+                # high-confidence (class, box) predictions if needed.
+                probs = pred_logits[i].sigmoid()              # [Q, C]
+                flat_scores = probs.flatten(0, 1)             # [Q*C]
+                k = min(TOP_K, flat_scores.numel())
+                topk_scores, topk_indices = flat_scores.topk(k)
+                # Decompose flat indices back into (query_idx, class_id)
+                query_idx = topk_indices // num_classes
+                class_ids = topk_indices % num_classes
 
-                boxes_cxcywh = pred_boxes_norm[i][topk_idx]  # [K, 4]
+                boxes_cxcywh = pred_boxes_norm[i][query_idx]  # [K, 4]
                 # Convert cxcywh normalised → xyxy pixel
                 boxes_xyxy = box_convert(boxes_cxcywh, "cxcywh", "xyxy")
                 boxes_xyxy[:, [0, 2]] *= img_w
@@ -160,8 +166,8 @@ def eval_one_epoch_detect(
 
                 preds_list.append({
                     "boxes": boxes_xyxy,
-                    "scores": scores[topk_idx],
-                    "labels": class_ids[topk_idx],
+                    "scores": topk_scores,
+                    "labels": class_ids,
                 })
 
                 # Ground-truth: cxcywh normalised → xyxy pixel
