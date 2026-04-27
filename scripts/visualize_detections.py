@@ -34,15 +34,6 @@ from data.detection_dataset import build_detection_dataset, collate_detection_ba
 from utils.checkpoint import load_checkpoint
 
 
-# ImageNet normalisation (HF DETR processor default). Used to invert the
-# pixel-value normalisation applied by the dataset/processor before display.
-_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-
-
-def _denormalise(img: torch.Tensor) -> torch.Tensor:
-    """Reverse ImageNet normalisation. Input/output: [3, H, W] float."""
-    return (img * _STD + _MEAN).clamp(0, 1)
 
 
 def _postprocess_predictions(
@@ -172,8 +163,7 @@ def main() -> None:
                 score_threshold=args.score_threshold, top_k=args.top_k,
             )
 
-            # Image (denormalised, on CPU)
-            img = _denormalise(pixel_values[0].cpu())
+            img = pixel_values[0].cpu().clamp(0, 1)
 
             # Ground-truth boxes
             gt = batch["labels"][0]
