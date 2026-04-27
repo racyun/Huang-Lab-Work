@@ -103,13 +103,20 @@ class FocusedModalDataset(Dataset):
     def __len__(self) -> int:
         return len(self.well_ids)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, int, int]:
+        """Return (image_resized, well_id, orig_h, orig_w).
+
+        Original dims are needed by detection so that bbox txt files
+        (authored in original-image pixel coords) can be normalised to
+        [0, 1] in a frame that survives any subsequent resize.
+        """
         well_id = self.well_ids[idx]
         p = self.well_to_path[well_id]
         with Image.open(p) as im:
             t = _pil_to_chw_float(im)
+        orig_h, orig_w = int(t.shape[-2]), int(t.shape[-1])
         t = _maybe_resize_chw(t, self.resize_hw)
-        return t, well_id
+        return t, well_id, orig_h, orig_w
 
 
 class HybridModalDataset(Dataset):

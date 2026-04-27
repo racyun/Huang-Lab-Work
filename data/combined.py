@@ -88,19 +88,29 @@ class _JoinedSplitDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         zstack, wz = self.bundle.z_ds[idx]
-        focused, wf = self.bundle.f_ds[idx]
+        focused, wf, foc_orig_h, foc_orig_w = self.bundle.f_ds[idx]
         hybrid, wh = self.bundle.h_ds[idx]
         if wz != wf or wz != wh:
             raise RuntimeError(f"Well id mismatch {wz} {wf} {wh}")
         well_id = wz
-        boxes = load_boxes_txt(self.bundle.labels_root / f"{well_id}.txt")
+        boxes_xyxy_pixel = load_boxes_txt(self.bundle.labels_root / f"{well_id}.txt")
+        # Normalise to [0, 1] xyxy using ORIGINAL focused image dims (the
+        # frame the bbox txt files were authored against). After this the
+        # boxes are frame-independent — any subsequent image resize is a
+        # no-op for the boxes' coordinates.
+        if boxes_xyxy_pixel.numel() > 0:
+            boxes_norm = boxes_xyxy_pixel.clone()
+            boxes_norm[:, [0, 2]] /= float(foc_orig_w)
+            boxes_norm[:, [1, 3]] /= float(foc_orig_h)
+        else:
+            boxes_norm = boxes_xyxy_pixel.reshape(0, 4)
         stiffness = torch.tensor([self.bundle.stiffness], dtype=torch.float32)
         return {
             "zstack": zstack,
             "focused": focused,
             "hybrid": hybrid,
             "stiffness": stiffness,
-            "boxes": boxes,
+            "boxes": boxes_norm,  # xyxy in [0, 1] — frame-independent
             "well_id": well_id,
             "split": self.bundle.split_name,
         }

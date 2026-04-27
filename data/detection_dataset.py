@@ -49,10 +49,30 @@ class TissueChipDetectionDataset(Dataset):
         new_h = max(1, int(round(h0 * scale)))
         new_w = max(1, int(round(w0 * scale)))
         img_r = F.interpolate(img.unsqueeze(0), size=(new_h, new_w), mode="bilinear", align_corners=False).squeeze(0)
-        boxes = s["boxes"]
-        if boxes.numel() > 0:
-            boxes = boxes * scale
-        boxes_norm = xyxy_pixel_to_cxcywh_norm(boxes, new_w, new_h)
+
+        # Sanity check — boxes must be in [0, 1] xyxy. If we got a stale
+        # cache that still has pixel-coord boxes, abort with a clear error
+        # rather than silently producing degenerate training targets.
+        boxes_xyxy_norm = s["boxes"]
+        if boxes_xyxy_norm.numel() > 0 and boxes_xyxy_norm.max() > 2.0:
+            raise RuntimeError(
+                "Detection cache holds boxes in pixel coords (max>2.0), but the "
+                "current code expects boxes normalised to [0, 1]. Wipe the detect "
+                "cache subdir and rerun:  rm -rf "
+                f"{getattr(self, '_cache_hint', '<cfg.dataset.cache_dir>/detect')}"
+            )
+
+        # Convert [0,1] xyxy -> [0,1] cxcywh (frame-independent: the
+        # image was just resized, but the boxes' [0,1] coords are preserved).
+        if boxes_xyxy_norm.numel() > 0:
+            x1, y1, x2, y2 = boxes_xyxy_norm.unbind(dim=-1)
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            w = (x2 - x1).clamp(min=1e-6)
+            h = (y2 - y1).clamp(min=1e-6)
+            boxes_norm = torch.stack([cx, cy, w, h], dim=-1)
+        else:
+            boxes_norm = boxes_xyxy_norm.reshape(0, 4)
         labels = torch.zeros((boxes_norm.shape[0],), dtype=torch.long)
         return {
             "pixel_values": img_r,
@@ -70,9 +90,13 @@ def build_detection_dataset(cfg: FullConfig) -> TissueChipDetectionDataset:
 
     base = build_tissue_chip_dataset(cfg.dataset)
     if cfg.dataset.cache_dir:
-        # Use a separate "detect" subdirectory so boxes are included in cached samples
-        # (pretrain cache omits boxes since TissueChipPretrainDataset doesn't need them)
-        detect_cache_dir = Path(cfg.dataset.cache_dir) / "detect"
+        # "detect_v2": the v1 cache (subdir "detect") stored boxes in original-image
+        # pixel coords, but FocusedModalDataset resized the image to 224×224 without
+        # rescaling the boxes — yielding cxcywh values like cx=5.5 (out of [0,1])
+        # downstream. Now boxes are normalised to [0,1] at load time using the
+        # original-image dims, so they're frame-independent. The new subdir prevents
+        # the stale v1 cache from being silently re-read.
+        detect_cache_dir = Path(cfg.dataset.cache_dir) / "detect_v2"
 
         # Precompute (split, well_id) per idx so cache hits avoid Drive reads.
         idx_to_key: list[str] = []
