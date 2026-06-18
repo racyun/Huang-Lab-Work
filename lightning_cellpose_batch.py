@@ -72,7 +72,7 @@ MODEL_TYPE    = 'cpsam'  # Cellpose-SAM
 DIAMETER      = None     # None = auto-estimate per image
 CHANNELS      = [0, 0]   # [0,0] = use all channels for SAM
 SKIP_EXISTING = True     # set False to reprocess everything from scratch
-BATCH_SIZE    = 8        # images processed per model.eval() call
+BATCH_SIZE    = 32       # images processed per model.eval() call
                          # increase if you have more RAM/GPU; decrease on OOM
 IMG_EXTS      = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
 
