@@ -38,7 +38,6 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-from tqdm import tqdm
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -153,8 +152,15 @@ def segment_folder(in_dir: Path, out_dir: Path, model) -> dict:
     skipped = len(skipped_paths)
     failed_files = []
 
+    total = len(todo)
+    done = 0  # images attempted (processed + failed), drives the progress print
+
+    def _report() -> None:
+        """Plain-text progress line (tmux-safe — no live redraw, unlike tqdm)."""
+        pct = (done / total * 100.0) if total else 100.0
+        print(f'  {in_dir.parent.name}: {done}/{total} images ({pct:.1f}%)', flush=True)
+
     chunks = [todo[i:i+BATCH_SIZE] for i in range(0, len(todo), BATCH_SIZE)]
-    pbar = tqdm(total=len(todo), desc=in_dir.parent.name, unit='img')
 
     for chunk in chunks:
         imgs, paths = [], []
@@ -166,7 +172,9 @@ def segment_folder(in_dir: Path, out_dir: Path, model) -> dict:
                 print(f'  [FAIL load] {p.name}: {e}')
                 failed_files.append(p.name)
                 failed += 1
-                pbar.update(1)
+                done += 1
+                if done % 10 == 0:
+                    _report()
 
         if not imgs:
             continue
@@ -182,7 +190,8 @@ def segment_folder(in_dir: Path, out_dir: Path, model) -> dict:
             print(f'  [FAIL batch] {[p.name for p in paths]}: {e}')
             failed += len(paths)
             failed_files += [p.name for p in paths]
-            pbar.update(len(paths))
+            done += len(paths)
+            _report()
             continue
 
         for p, mask in zip(paths, masks_list):
@@ -194,9 +203,12 @@ def segment_folder(in_dir: Path, out_dir: Path, model) -> dict:
                 print(f'  [FAIL save] {p.name}: {e}')
                 failed += 1
                 failed_files.append(p.name)
-            pbar.update(1)
+            done += 1
+            if done % 10 == 0:
+                _report()
 
-    pbar.close()
+    if done % 10 != 0:  # final tally if it didn't land on a multiple of 10
+        _report()
     if failed_files:
         print(f'  Failed files: {failed_files}')
     return {'processed': processed, 'skipped': skipped, 'failed': failed}
