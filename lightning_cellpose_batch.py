@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -46,8 +47,17 @@ from tqdm import tqdm
 # Path inside your Google Drive (relative to gdrive: remote root, i.e. 'My Drive')
 DRIVE_ROOT = 'Fusion AI/Prof Huang Project/Cellpose feature extractions'
 
-# Path on Lightning Studio's local disk (fast I/O, persistent across restarts)
-LOCAL_ROOT = Path('/teamspace/studios/this_studio/cellpose_work')
+# Local disk path where images are cached during processing.
+# Defaults to the Lightning Studio path; override with the CELLPOSE_LOCAL_ROOT
+# env var (e.g. on a Mac:  export CELLPOSE_LOCAL_ROOT=~/cellpose_work ).
+# Falls back to ~/cellpose_work automatically if the Lightning path is absent.
+_default_root = Path('/teamspace/studios/this_studio/cellpose_work')
+if 'CELLPOSE_LOCAL_ROOT' in os.environ:
+    LOCAL_ROOT = Path(os.environ['CELLPOSE_LOCAL_ROOT']).expanduser()
+elif _default_root.parent.parent.exists():  # /teamspace/studios exists -> on Lightning
+    LOCAL_ROOT = _default_root
+else:
+    LOCAL_ROOT = Path.home() / 'cellpose_work'
 
 # Stiffness conditions — one per folder
 CONDITIONS = [
