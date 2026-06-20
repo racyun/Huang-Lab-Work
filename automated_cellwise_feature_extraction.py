@@ -92,6 +92,7 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
             'ch1_cellwise_mean_intensity',
             'ch2_cellwise_mean_membrane_intensity',
             'ch3_cellwise_mean_intensity',
+            'centroid_x', 'centroid_y',
         ])
         df.index.name = 'cell_id'
         df.to_csv(output_csv_path)
@@ -132,8 +133,12 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
     areas = np.bincount(mask.ravel())[cell_ids]
 
     # ----- Per-cell elongation (major / minor axis of the equivalent ellipse) -----
+    # ----- and centroid coordinates (needed for Stage 2 graph construction) -----
     props = pd.DataFrame(
-        regionprops_table(mask, properties=('label', 'axis_major_length', 'axis_minor_length'))
+        regionprops_table(
+            mask,
+            properties=('label', 'axis_major_length', 'axis_minor_length', 'centroid'),
+        )
     ).set_index('label')
     elongation = np.where(
         props['axis_minor_length'] > 0,
@@ -141,6 +146,9 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
         np.nan,
     )
     elongation = pd.Series(elongation, index=props.index).reindex(cell_ids).to_numpy()
+    # regionprops names centroid columns 'centroid-0' (row/y) and 'centroid-1' (col/x)
+    centroid_y = props['centroid-0'].reindex(cell_ids).to_numpy()
+    centroid_x = props['centroid-1'].reindex(cell_ids).to_numpy()
 
     # ----- Combine and save -----
     df = pd.DataFrame(
@@ -150,6 +158,8 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
             'ch1_cellwise_mean_intensity':          whole_cell_means[0],
             'ch2_cellwise_mean_membrane_intensity': membrane_means,
             'ch3_cellwise_mean_intensity':          whole_cell_means[2],
+            'centroid_x':                           centroid_x,
+            'centroid_y':                           centroid_y,
         },
         index=cell_ids,
     )
