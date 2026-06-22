@@ -47,18 +47,27 @@ has columns:
 
 ```
 cell_id, area_px, elongation,
-ch1_cellwise_mean_intensity,
-ch2_cellwise_mean_membrane_intensity,
-ch3_cellwise_mean_intensity,
+ch1_cellwise_mean_intensity,            # DAPI (nuclei, reference)
+ch2_cellwise_mean_membrane_intensity,  # VE-cadherin (endothelial, membrane band)
+ch3_cellwise_mean_intensity,           # TAGLN (mesenchymal, whole-cell)
+endmt_score,                           # relative-ratio EndMT index, [0, 1]
 centroid_x, centroid_y
 ```
+
+**Channel map (from Carver):** CH1 = DAPI, CH2 = GFP/VE-cadherin, CH3 =
+AF594/TAGLN. The EndMT score (relative-ratio form, bounded [0, 1], per the lab
+master doc) uses E = VE-cadherin membrane signal (CH2) and M = TAGLN whole-cell
+signal (CH3), each **background-subtracted** via the median of that channel over
+non-cell (`mask == 0`) pixels and clamped at 0, then `endmt_score = M / (E + M)`:
+~0 = endothelial, ~1 = mesenchymal. DAPI is used only to identify cells, not in
+the score. Cells with no membrane band or no signal in either marker → `NaN`.
 
 | Gap | Resolution |
 |---|---|
 | **No `image_id` / `condition`** — image identity lives only in the filename/folder | Inject both when concatenating: `image_id` from the filename stem, `condition` from the parent folder name. Without them you can't keep graphs separate or tag them downstream. |
 | **`cell_id` is not globally unique** — it resets to 1,2,3… per image | Fine *within* a graph. Globally, disambiguate with the pair (`image_id`, `cell_id`). No need to renumber. |
 | **Well-level metadata (stiffness / nicotine / ECM)** | **Deliberately NOT node features.** They are constant within an image (no within-graph signal) and would defeat the Stage 3 adversarial scrubbing. Carry **only** `condition` as a **graph-level label** on the `Data` object for downstream stratification / adversarial training — never as a column of `x`. |
-| **Feature vector is thin** (5 features, no EndMT score) | Not blocking. Motifs will only be as rich as the features. Add EndMT score in Stage 1 later to enrich. |
+| **Feature vector is thin** (6 features incl. EndMT score) | Not blocking. Motifs will only be as rich as the features. `endmt_score` is already a calibrated [0, 1] quantity (background-subtracted relative ratio); keep it **raw** — do not z-score it with the other features (that would destroy the "0 = endothelial, 1 = mesenchymal" meaning). |
 | **Coordinate column names** | Already `centroid_x` / `centroid_y` (the plan calls them `x` / `y`). Trivial rename in the builder. |
 
 ### Prerequisite step: assemble the master table
@@ -71,6 +80,12 @@ Between Stage 1 and Stage 2, add a small step that:
    *all* conditions, computed once). This is the cross-image normalization the
    plan implies — without it, large-magnitude columns (`area_px`) drown out the
    rest in both the GNN and the contrastive loss.
+4. **Leaves `endmt_score` as-is.** It is computed per image in Stage 1 with
+   per-image background subtraction and is already a calibrated [0, 1] ratio
+   (self-normalizing for multiplicative per-cell effects). Do **not** z-score it
+   in step 3 — exclude it from the global standardization so its [0, 1]
+   semantics survive. (If cross-batch drift in the score is later observed in
+   QC, apply a per-batch robust rescale of the score only, downstream.)
 
 > Note: well-level metadata (stiffness, nicotine, ECM) is dropped from the
 > cellwise features entirely — it was never in the per-cell vector and should
@@ -258,10 +273,11 @@ stay one-per-graph.
 
 - [ ] Add an **assemble-master-table** step: concatenate all Stage 1 CSVs, add
       `image_id` (from filename) + `condition` (from folder).
-- [ ] **Z-score feature columns globally** across the whole dataset.
+- [ ] **Z-score feature columns globally** across the whole dataset
+      (exclude `endmt_score` — keep it raw [0, 1]).
 - [ ] Keep `condition` as a **graph-level tag**; exclude all well-level
-      metadata from the node feature vector.
-- [ ] (Stage 1, optional later) add an **EndMT score** to enrich node features.
+      metadata (stiffness / ECM / nicotine) from the node feature vector.
+- [x] (Stage 1) **EndMT score added** to the per-cell extractor (`endmt_score`).
 - [ ] Write `build_graphs.py` implementing §2–§5, emitting the §8 outputs.
 - [ ] Add `on_border` node feature (§7).
 - [ ] Run the §6 QC suite and review overlays before starting Stage 3.
