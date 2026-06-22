@@ -92,6 +92,7 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
             'ch1_cellwise_mean_intensity',
             'ch2_cellwise_mean_membrane_intensity',
             'ch3_cellwise_mean_intensity',
+            'endmt_score',
             'centroid_x', 'centroid_y',
         ])
         df.index.name = 'cell_id'
@@ -150,6 +151,30 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
     centroid_y = props['centroid-0'].reindex(cell_ids).to_numpy()
     centroid_x = props['centroid-1'].reindex(cell_ids).to_numpy()
 
+    # ----- EndMT score (relative-ratio form, per the lab's master doc) -----
+    # EndMT = endothelial marker loss + mesenchymal marker gain:
+    #   E = VE-cadherin (CH2, membrane band);  M = TAGLN (CH3, whole-cell).
+    # Each marker is background-subtracted using the median of that channel over
+    # non-cell (mask == 0) pixels, then clamped at 0 (the doc's required step;
+    # the AF594/TAGLN channel has a high background floor that otherwise makes
+    # every cell read partly mesenchymal). DAPI (CH1) is used only to identify
+    # cells, not in the score.
+    #   endmt_score = M / (E + M)   in [0, 1]:  ~0 = endothelial, ~1 = mesenchymal.
+    # Invalid cells (no membrane band, or no signal in either marker) -> NaN.
+    eps = 1e-6
+    tagln = image[..., 2]
+    bg_pixels = (mask == 0)
+    if bg_pixels.any():
+        bg_E = float(np.median(ve_cad[bg_pixels]))
+        bg_M = float(np.median(tagln[bg_pixels]))
+    else:
+        bg_E = bg_M = 0.0
+    e_sig = np.clip(membrane_means - bg_E, 0.0, None)        # NaN (no band) stays NaN
+    m_sig = np.clip(whole_cell_means[2] - bg_M, 0.0, None)
+    denom = e_sig + m_sig
+    with np.errstate(invalid='ignore', divide='ignore'):
+        endmt_score = np.where(denom > eps, m_sig / denom, np.nan)
+
     # ----- Combine and save -----
     df = pd.DataFrame(
         {
@@ -158,6 +183,7 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
             'ch1_cellwise_mean_intensity':          whole_cell_means[0],
             'ch2_cellwise_mean_membrane_intensity': membrane_means,
             'ch3_cellwise_mean_intensity':          whole_cell_means[2],
+            'endmt_score':                          endmt_score,
             'centroid_x':                           centroid_x,
             'centroid_y':                           centroid_y,
         },
