@@ -70,11 +70,17 @@ def _default_local_root() -> Path:
     return Path.home() / "cellpose_work"
 
 
-def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float):
+def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float,
+                image_w: float | None = None, image_h: float | None = None):
     """Build one PyG Data from a single image's rows. Returns (data, qc_dict).
 
     df_image must contain centroid_x/centroid_y, the ZSCORE_COLS, endmt_score,
     image_id and condition.
+
+    image_w/image_h: true pixel dimensions of the field of view, used for the
+    on_border flag (a cell is on_border if its centroid is within d_max of pixel
+    0 or of the image width/height). If None, fall back to the bounding box of
+    the cell centroids (less accurate — see docs §7).
     """
     image_id = str(df_image["image_id"].iloc[0])
     condition = str(df_image["condition"].iloc[0])
@@ -136,15 +142,19 @@ def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float):
     n_undirected = len(e_dist) // 2
     qc["n_edges"] = n_undirected
 
-    # ----- on_border node feature (doc §7): centroid within d_max of the
-    #       per-image centroid bounding box (proxy for field-of-view edge) -----
+    # ----- on_border node feature (doc §7): centroid within d_max of a field-
+    #       of-view edge. Use true image dims (image_w/image_h) when given;
+    #       else fall back to the centroid bounding box (less accurate) -----
     on_border = np.zeros(n, dtype=float)
     if n >= 1 and np.isfinite(d_max):
-        xmin, ymin = pos_np.min(axis=0)
-        xmax, ymax = pos_np.max(axis=0)
+        if image_w is not None and image_h is not None:
+            x0, y0, x1, y1 = 0.0, 0.0, float(image_w), float(image_h)
+        else:
+            x0, y0 = pos_np.min(axis=0)
+            x1, y1 = pos_np.max(axis=0)
         near = (
-            (pos_np[:, 0] - xmin < d_max) | (xmax - pos_np[:, 0] < d_max) |
-            (pos_np[:, 1] - ymin < d_max) | (ymax - pos_np[:, 1] < d_max)
+            (pos_np[:, 0] - x0 < d_max) | (x1 - pos_np[:, 0] < d_max) |
+            (pos_np[:, 1] - y0 < d_max) | (y1 - pos_np[:, 1] < d_max)
         )
         on_border = near.astype(float)
     qc["n_on_border"] = int(on_border.sum())
@@ -214,6 +224,9 @@ def main() -> None:
     ap.add_argument("--k", type=int, default=8, help="k for k-NN (default: 8)")
     ap.add_argument("--d-max-mult", type=float, default=3.0,
                     help="d_max = mult x median NN distance per image (default: 3.0)")
+    ap.add_argument("--image-size", type=int, default=682,
+                    help="square image side in px for on_border; 0 = use centroid "
+                         "bounding box instead (default: 682)")
     ap.add_argument("--overlays-per-condition", type=int, default=5)
     args = ap.parse_args()
 
@@ -238,10 +251,12 @@ def main() -> None:
     qc_rows = []
     overlay_counts: dict[str, int] = {}
     n_graphs = 0
+    img_dim = float(args.image_size) if args.image_size and args.image_size > 0 else None
 
     # group by image; keep condition order stable
     for (condition, image_id), df_img in master.groupby(["condition", "image_id"], sort=True):
-        data, qc = build_graph(df_img, k=args.k, d_max_mult=args.d_max_mult)
+        data, qc = build_graph(df_img, k=args.k, d_max_mult=args.d_max_mult,
+                               image_w=img_dim, image_h=img_dim)
         cond_dir = graphs_dir / condition
         cond_dir.mkdir(parents=True, exist_ok=True)
         torch.save(data, cond_dir / f"{image_id}.pt")

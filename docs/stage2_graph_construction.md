@@ -235,9 +235,12 @@ stay one-per-graph.
 - **Tiny images (< k+1 cells):** skip, or fall back to a fully-connected graph.
   Log and review.
 - **Border cells:** their neighborhood is physically truncated by the field of
-  view. Add a boolean node feature `on_border` (centroid within `d_max` of the
-  image bounding box) so the model can learn to discount them — and so you can
+  view. Add a boolean node feature `on_border` (centroid within `d_max` of a
+  true image edge) so the model can learn to discount them — and so you can
   exclude them from motif-frequency stats later. **Flag-and-keep, don't drop.**
+  All images are 682×682, so `build_graphs.py --image-size 682` (the default)
+  uses the real field-of-view edges; pass `--image-size 0` to fall back to the
+  centroid bounding box if dimensions ever vary.
 - **Segmentation merges/splits:** not fixable here, but over/under-segmentation
   directly corrupts the graph. If Stage 1 segmentation is shaky, that's the
   higher-leverage thing to fix.
