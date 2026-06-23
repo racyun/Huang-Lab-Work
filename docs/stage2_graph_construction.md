@@ -271,13 +271,34 @@ stay one-per-graph.
 
 ## 10. Change checklist (to close the gaps before coding the builder)
 
-- [ ] Add an **assemble-master-table** step: concatenate all Stage 1 CSVs, add
-      `image_id` (from filename) + `condition` (from folder).
-- [ ] **Z-score feature columns globally** across the whole dataset
-      (exclude `endmt_score` — keep it raw [0, 1]).
-- [ ] Keep `condition` as a **graph-level tag**; exclude all well-level
-      metadata (stiffness / ECM / nicotine) from the node feature vector.
+- [x] Add an **assemble-master-table** step: concatenate all Stage 1 CSVs, add
+      `image_id` (from filename) + `condition` (from folder). → `assemble_master_table.py`
+- [x] **Z-score feature columns globally** across the whole dataset
+      (exclude `endmt_score` — keep it raw [0, 1]). → `assemble_master_table.py`
+- [x] Keep `condition` as a **graph-level tag**; exclude all well-level
+      metadata (stiffness / ECM / nicotine) from the node feature vector. → `build_graphs.py`
 - [x] (Stage 1) **EndMT score added** to the per-cell extractor (`endmt_score`).
-- [ ] Write `build_graphs.py` implementing §2–§5, emitting the §8 outputs.
-- [ ] Add `on_border` node feature (§7).
+- [x] Write `build_graphs.py` implementing §2–§5, emitting the §8 outputs.
+- [x] Add `on_border` node feature (§7). → `build_graphs.py`
 - [ ] Run the §6 QC suite and review overlays before starting Stage 3.
+
+## 11. How to run (Stage 2)
+
+```bash
+pip install torch torch_geometric scipy scikit-image pandas matplotlib
+
+# 1. assemble + globally normalize the master cell table
+python assemble_master_table.py            # reads <root>/cellwise_metadata/
+
+# 2. build one spatial graph per image (+ QC csv + overlays)
+python build_graphs.py --k 8 --d-max-mult 3.0
+```
+
+`<root>` follows the Stage 1 convention (`CELLPOSE_LOCAL_ROOT`, else the
+Lightning Studio path, else `~/cellpose_work`). Outputs land in
+`<root>/master_table.csv`, `<root>/graphs/<condition>/<image_id>.pt`,
+`<root>/graph_qc.csv`, and `<root>/graph_overlays/`.
+
+Node-feature order (`graphs/feature_names.json`): the 5 globally z-scored
+morphology/intensity columns, then raw `endmt_score`, then `on_border`.
+Edge attributes: `[dist, dist_norm, inv_dist, is_mutual]`.
