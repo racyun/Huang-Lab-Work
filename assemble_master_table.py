@@ -27,10 +27,14 @@ import argparse
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Drive location (relative to the gdrive: rclone remote), matching the other stages.
+DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 
 # Feature columns that get GLOBAL z-scoring (large-magnitude / open-ended).
 ZSCORE_COLS = [
@@ -72,7 +76,18 @@ def image_id_from_path(csv_path: Path) -> str:
     return re.sub(r"_metadata$", "", csv_path.stem)
 
 
-def assemble(metadata_dir: Path, out_dir: Path) -> pd.DataFrame:
+def push_file_to_drive(local: Path, drive_subpath: str = "") -> None:
+    """rclone-copy a single file up to gdrive:<DRIVE_ROOT>/<drive_subpath>."""
+    remote = f"gdrive:{DRIVE_ROOT}"
+    if drive_subpath:
+        remote = f"{remote}/{drive_subpath}"
+    print(f"  $ rclone copyto {local.name} -> {remote}/{local.name}")
+    r = subprocess.run(["rclone", "copyto", str(local), f"{remote}/{local.name}"])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone copyto failed (exit {r.returncode})")
+
+
+def assemble(metadata_dir: Path, out_dir: Path, push_to_drive: bool = False) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     entries = discover_csvs(metadata_dir)
     if not entries:
@@ -127,6 +142,12 @@ def assemble(metadata_dir: Path, out_dir: Path) -> pd.DataFrame:
 
     print(f"\nWrote {master_path}")
     print(f"Wrote {stats_path}")
+
+    if push_to_drive:
+        print("\nPushing to Drive...")
+        push_file_to_drive(master_path)
+        push_file_to_drive(stats_path)
+
     return master
 
 
@@ -137,8 +158,10 @@ def main() -> None:
                     help="dir holding <condition>/<name>_metadata.csv (default: %(default)s)")
     ap.add_argument("--out-dir", type=Path, default=root,
                     help="where to write master_table.csv (default: %(default)s)")
+    ap.add_argument("--push-to-drive", action="store_true",
+                    help="rclone-copy master_table.csv + stats up to gdrive: when done")
     args = ap.parse_args()
-    assemble(args.metadata_dir, args.out_dir)
+    assemble(args.metadata_dir, args.out_dir, push_to_drive=args.push_to_drive)
 
 
 if __name__ == "__main__":

@@ -28,10 +28,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Drive location (relative to the gdrive: rclone remote), matching the other stages.
+DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 
 try:
     import torch
@@ -215,6 +219,20 @@ def save_overlay(data, out_png: Path) -> None:
     plt.close(fig)
 
 
+def _push_to_drive(graphs_dir: Path, qc_path: Path, overlays_dir: Path) -> None:
+    """rclone-copy the Stage 2 outputs up to gdrive:<DRIVE_ROOT>."""
+    def copy(args: list) -> None:
+        print(f"  $ rclone {' '.join(args)}")
+        r = subprocess.run(["rclone", *args, "--transfers=8", "--checkers=16"])
+        if r.returncode != 0:
+            raise RuntimeError(f"rclone failed (exit {r.returncode})")
+    base = f"gdrive:{DRIVE_ROOT}"
+    copy(["copy", str(graphs_dir), f"{base}/graphs"])
+    copy(["copyto", str(qc_path), f"{base}/{qc_path.name}"])
+    if overlays_dir.exists() and any(overlays_dir.iterdir()):
+        copy(["copy", str(overlays_dir), f"{base}/graph_overlays"])
+
+
 def main() -> None:
     root = _default_local_root()
     ap = argparse.ArgumentParser(description="Build per-image spatial graphs (Stage 2).")
@@ -228,6 +246,8 @@ def main() -> None:
                     help="square image side in px for on_border; 0 = use centroid "
                          "bounding box instead (default: 682)")
     ap.add_argument("--overlays-per-condition", type=int, default=5)
+    ap.add_argument("--push-to-drive", action="store_true",
+                    help="rclone-copy graphs/, graph_qc.csv, graph_overlays/ up to gdrive: when done")
     args = ap.parse_args()
 
     if not args.master_table.exists():
@@ -280,6 +300,11 @@ def main() -> None:
     print(f"Built {n_graphs} graph(s) -> {graphs_dir}")
     print(f"Wrote QC -> {qc_path}")
     print(f"Wrote {sum(overlay_counts.values())} overlay(s) -> {overlays_dir}")
+
+    if args.push_to_drive:
+        print("\nPushing to Drive...")
+        _push_to_drive(graphs_dir, qc_path, overlays_dir)
+
     print("\nPer-condition summary:")
     summ = qc_df.groupby("condition").agg(
         images=("image_id", "count"),

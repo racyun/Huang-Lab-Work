@@ -295,7 +295,16 @@ python assemble_master_table.py            # reads <root>/cellwise_metadata/
 
 # 2. build one spatial graph per image (+ QC csv + overlays)
 python build_graphs.py --k 8 --d-max-mult 3.0
+
+# Add --push-to-drive to either script to rclone the outputs up to
+# gdrive:<DRIVE_ROOT> when done (Lightning Studios are ephemeral — back them up):
+python assemble_master_table.py --push-to-drive
+python build_graphs.py --push-to-drive
 ```
+
+Graphs are the **direct input to Stage 3** (the GNN reads them via
+`Batch.from_data_list`). Load a saved graph with
+`torch.load(path, weights_only=False)` (required on torch >= 2.6).
 
 `<root>` follows the Stage 1 convention (`CELLPOSE_LOCAL_ROOT`, else the
 Lightning Studio path, else `~/cellpose_work`). Outputs land in
