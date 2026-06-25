@@ -265,8 +265,13 @@ def main() -> None:
 
         c = overlay_counts.get(condition, 0)
         if c < args.overlays_per_condition and data.edge_index.shape[1] > 0:
-            save_overlay(data, overlays_dir / f"{condition}__{image_id}.png")
-            overlay_counts[condition] = c + 1
+            try:
+                save_overlay(data, overlays_dir / f"{condition}__{image_id}.png")
+                overlay_counts[condition] = c + 1
+            except Exception as e:  # overlays are optional — never abort the build
+                if n_graphs == 1:  # warn once
+                    print(f"  [warn] overlay generation skipped ({e}). "
+                          f"Install matplotlib to enable overlays.")
 
     qc_df = pd.DataFrame(qc_rows)
     qc_path = args.out_dir / "graph_qc.csv"
