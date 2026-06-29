@@ -3,8 +3,7 @@
 This document is the deep-dive companion to
 [stage3_gnn_encoder.md](stage3_gnn_encoder.md). For every architectural choice it
 states **what** it does, **why** it's the right choice here, and **what
-alternatives it beats**. The goal is a methodology that holds up in a lab
-meeting or a methods section.
+alternatives it beats**.
 
 ---
 
