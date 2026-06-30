@@ -70,6 +70,14 @@ RESTRICT_OUTWARD_TO_BG = True
 IMG_EXTENSIONS = {'.tif', '.tiff'}
 SKIP_EXISTING = True   # skip pairs whose metadata CSV already exists locally
 
+# Channel axis indices in the focus-stacked tiles (verified from the raw planes).
+# The tiles are stored in RGB-plane order, which is the REVERSE of the CH1/CH2/CH3
+# numbering: index 0 = Red = TAGLN (CH3), index 1 = Green = VE-cadherin (CH2),
+# index 2 = Blue = DAPI (CH1). Always read channels via these constants.
+DAPI_IDX  = 2   # CH1, nuclei (identification only)
+VECAD_IDX = 1   # CH2, VE-cadherin (endothelial, membrane band)
+TAGLN_IDX = 0   # CH3, TAGLN (mesenchymal, whole-cell)
+
 
 def process_image_mask_pair(image_path, mask_path, output_csv_path,
                             band_width=BAND_WIDTH,
@@ -99,15 +107,15 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
         df.to_csv(output_csv_path)
         return df
 
-    # ----- Channels 1 & 3 (axis indices 0 and 2): whole-cell mean -----
-    whole_cell_channels = [0, 2]
+    # ----- DAPI (CH1) & TAGLN (CH3): whole-cell mean -----
+    whole_cell_channels = [DAPI_IDX, TAGLN_IDX]
     whole_cell_means = {
         c: ndimage.mean(image[..., c], labels=mask, index=cell_ids)
         for c in whole_cell_channels
     }
 
-    # ----- Channel 2 (axis index 1, VE-cadherin): membrane-band mean -----
-    ve_cad = image[..., 1]
+    # ----- VE-cadherin (CH2): membrane-band mean -----
+    ve_cad = image[..., VECAD_IDX]
     slices = ndimage.find_objects(mask)
     membrane_means = np.full(len(cell_ids), np.nan)
     for i, cid in enumerate(cell_ids):
@@ -162,7 +170,7 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
     #   endmt_score = M / (E + M)   in [0, 1]:  ~0 = endothelial, ~1 = mesenchymal.
     # Invalid cells (no membrane band, or no signal in either marker) -> NaN.
     eps = 1e-6
-    tagln = image[..., 2]
+    tagln = image[..., TAGLN_IDX]
     bg_pixels = (mask == 0)
     if bg_pixels.any():
         bg_E = float(np.median(ve_cad[bg_pixels]))
@@ -170,7 +178,7 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
     else:
         bg_E = bg_M = 0.0
     e_sig = np.clip(membrane_means - bg_E, 0.0, None)        # NaN (no band) stays NaN
-    m_sig = np.clip(whole_cell_means[2] - bg_M, 0.0, None)
+    m_sig = np.clip(whole_cell_means[TAGLN_IDX] - bg_M, 0.0, None)
     denom = e_sig + m_sig
     with np.errstate(invalid='ignore', divide='ignore'):
         endmt_score = np.where(denom > eps, m_sig / denom, np.nan)
@@ -180,9 +188,9 @@ def process_image_mask_pair(image_path, mask_path, output_csv_path,
         {
             'area_px':                              areas,
             'elongation':                           elongation,
-            'ch1_cellwise_mean_intensity':          whole_cell_means[0],
+            'ch1_cellwise_mean_intensity':          whole_cell_means[DAPI_IDX],
             'ch2_cellwise_mean_membrane_intensity': membrane_means,
-            'ch3_cellwise_mean_intensity':          whole_cell_means[2],
+            'ch3_cellwise_mean_intensity':          whole_cell_means[TAGLN_IDX],
             'endmt_score':                          endmt_score,
             'centroid_x':                           centroid_x,
             'centroid_y':                           centroid_y,
