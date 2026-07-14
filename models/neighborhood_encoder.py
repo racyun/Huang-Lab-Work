@@ -21,6 +21,43 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, global_mean_pool
 
 
+class _GradReverse(torch.autograd.Function):
+    """Gradient Reversal Layer: identity forward, negated (x lambda) gradient back."""
+
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambd, None
+
+
+def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
+    return _GradReverse.apply(x, lambd)
+
+
+class ConditionAdversary(nn.Module):
+    """Small MLP that predicts `condition` from the embedding, through a GRL.
+
+    Forward multiplies the incoming gradient by -lambd (via the GRL) so the
+    encoder is trained to make `condition` UNpredictable, while the adversary
+    itself still learns to predict it as well as it can. Returns class logits.
+    """
+
+    def __init__(self, emb_dim: int, n_conditions: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(emb_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, n_conditions),
+        )
+
+    def forward(self, h: torch.Tensor, lambd: float) -> torch.Tensor:
+        return self.net(grad_reverse(h, lambd))
+
+
 class NeighborhoodEncoder(nn.Module):
     """GATv2 encoder mapping a (batched) neighborhood subgraph -> embedding.
 

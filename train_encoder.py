@@ -45,7 +45,9 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import k_hop_subgraph
 
-from models.neighborhood_encoder import NeighborhoodEncoder, nt_xent_loss
+from models.neighborhood_encoder import (
+    NeighborhoodEncoder, ConditionAdversary, nt_xent_loss,
+)
 
 DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 
@@ -167,16 +169,24 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
         self._graph_cache: dict[str, Data] = {}
         # build (path, center) index over all cells that have neighbors
         self.index: list[tuple[str, int]] = []
+        conds = set()
         for p in graph_paths:
             g = torch.load(p, weights_only=False)
             if g.edge_index.shape[1] == 0:
                 continue
             self._graph_cache[p] = g
+            conds.add(g.condition)
             deg = torch.bincount(g.edge_index[0], minlength=g.num_nodes)
             for c in torch.nonzero(deg > 0).flatten().tolist():
                 self.index.append((p, c))
+        # stable condition -> integer label (for the adversary)
+        self.conditions = sorted(conds)
+        self.cond_to_idx = {c: i for i, c in enumerate(self.conditions)}
+        self._path_cond = {p: self.cond_to_idx[g.condition]
+                           for p, g in self._graph_cache.items()}
         self.samples_per_epoch = samples_per_epoch or len(self.index)
-        print(f"  {len(self.index)} candidate neighborhoods over {len(self._graph_cache)} graphs")
+        print(f"  {len(self.index)} candidate neighborhoods over "
+              f"{len(self._graph_cache)} graphs, {len(self.conditions)} conditions")
 
     def __len__(self):
         return self.samples_per_epoch
@@ -185,7 +195,10 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
         # random draw each call (i is ignored beyond bounding the epoch length)
         path, center = self.index[random.randrange(len(self.index))]
         sub = extract_neighborhood(self._graph_cache[path], center, self.hops)
-        return augment(sub, **self.aug_kwargs), augment(sub, **self.aug_kwargs)
+        cond = self._path_cond[path]
+        va, vb = augment(sub, **self.aug_kwargs), augment(sub, **self.aug_kwargs)
+        va.y = torch.tensor([cond]); vb.y = torch.tensor([cond])   # condition label
+        return va, vb
 
 
 def paired_collate(batch):
@@ -228,6 +241,15 @@ def main() -> None:
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--num-workers", type=int, default=4)
+    # ----- adversarial confound scrubbing (methodology §6, §9) -----
+    ap.add_argument("--adversarial", action="store_true",
+                    help="add a gradient-reversal condition adversary to scrub the confound")
+    ap.add_argument("--adv-lambda-max", type=float, default=1.0,
+                    help="peak GRL strength lambda (ramped 0 -> this)")
+    ap.add_argument("--adv-gamma", type=float, default=10.0,
+                    help="DANN lambda-ramp steepness")
+    ap.add_argument("--adv-hidden", type=int, default=64,
+                    help="hidden width of the adversary MLP")
     ap.add_argument("--push-to-drive", action="store_true")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="huang-lab-stage3")
@@ -256,7 +278,17 @@ def main() -> None:
     model = NeighborhoodEncoder(in_dim=in_dim, hidden_dim=args.hidden_dim,
                                 emb_dim=args.emb_dim, heads=args.heads,
                                 edge_dim=4, dropout=args.dropout).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # ----- adversary (optional): predicts condition from h through a GRL -----
+    adversary = None
+    params = list(model.parameters())
+    if args.adversarial:
+        adversary = ConditionAdversary(args.emb_dim, len(ds.conditions),
+                                       hidden=args.adv_hidden).to(device)
+        params += list(adversary.parameters())
+        print(f"  adversarial scrubbing ON — {len(ds.conditions)} conditions, "
+              f"lambda ramps 0 -> {args.adv_lambda_max}")
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
     steps_per_epoch = max(1, len(ds) // args.batch_size)
     total_steps = args.epochs * steps_per_epoch
@@ -267,6 +299,11 @@ def main() -> None:
             return args.lr * step / max(1, warmup_steps)
         prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * args.lr * (1 + math.cos(math.pi * prog))   # cosine decay
+
+    def lambda_at(step: int) -> float:
+        # DANN schedule: lambda = lambda_max * (2/(1+exp(-gamma*p)) - 1), p in [0,1]
+        p = step / max(1, total_steps)
+        return args.adv_lambda_max * (2.0 / (1.0 + math.exp(-args.adv_gamma * p)) - 1.0)
 
     stage3 = args.out_dir / "stage3"
     stage3.mkdir(parents=True, exist_ok=True)
@@ -280,33 +317,60 @@ def main() -> None:
 
     print(f"Training {args.epochs} epochs x {steps_per_epoch} steps "
           f"(batch {args.batch_size}, {len(ds)} samples/epoch)")
+    ce = torch.nn.CrossEntropyLoss()
     step = 0
     t0 = time.time()
     for epoch in range(args.epochs):
         model.train()
-        ep_loss = 0.0; nb = 0
+        if adversary is not None:
+            adversary.train()
+        ep_loss = 0.0; ep_con = 0.0; ep_adv = 0.0; ep_adv_acc = 0.0; nb = 0
         for view_a, view_b in loader:
             for grp in opt.param_groups:
                 grp["lr"] = lr_at(step)
             view_a = view_a.to(device); view_b = view_b.to(device)
-            _, z1 = model(view_a)
-            _, z2 = model(view_b)
-            loss = nt_xent_loss(z1, z2, temperature=args.temperature)
-            opt.zero_grad(); loss.backward(); opt.step()
-            ep_loss += loss.item(); nb += 1; step += 1
-            if step % 10 == 0:
-                _wandb_log(wandb_run, {"train/step_loss": loss.item(),
-                                       "train/lr": lr_at(step)}, step)
+            h1, z1 = model(view_a)
+            h2, z2 = model(view_b)
+            loss_con = nt_xent_loss(z1, z2, temperature=args.temperature)
+            loss = loss_con
 
-        ep_loss /= max(1, nb)
-        rec = {"epoch": epoch, "loss": ep_loss, "lr": lr_at(step),
-               "elapsed_min": round((time.time() - t0) / 60, 2)}
+            lam = 0.0; loss_adv_val = 0.0; adv_acc = 0.0
+            if adversary is not None:
+                lam = lambda_at(step)
+                h = torch.cat([h1, h2], dim=0)                 # both views
+                y = torch.cat([view_a.y, view_b.y], dim=0).view(-1)
+                logits = adversary(h, lam)                     # GRL inside
+                loss_adv = ce(logits, y)
+                loss = loss_con + loss_adv                     # GRL flips enc. gradient
+                loss_adv_val = loss_adv.item()
+                adv_acc = (logits.argmax(1) == y).float().mean().item()
+
+            opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += loss.item(); ep_con += loss_con.item()
+            ep_adv += loss_adv_val; ep_adv_acc += adv_acc; nb += 1; step += 1
+            if step % 10 == 0:
+                m = {"train/step_loss": loss.item(), "train/lr": lr_at(step)}
+                if adversary is not None:
+                    m.update({"adv/lambda": lam, "adv/step_loss": loss_adv_val,
+                              "adv/step_acc": adv_acc})
+                _wandb_log(wandb_run, m, step)
+
+        ep_loss /= max(1, nb); ep_con /= max(1, nb)
+        ep_adv /= max(1, nb); ep_adv_acc /= max(1, nb)
+        rec = {"epoch": epoch, "loss": ep_loss, "con_loss": ep_con,
+               "lr": lr_at(step), "elapsed_min": round((time.time() - t0) / 60, 2)}
+        wm = {"train/loss": ep_loss, "train/con_loss": ep_con,
+              "train/lr": lr_at(step), "epoch": epoch}
+        adv_str = ""
+        if adversary is not None:
+            rec.update({"adv_loss": ep_adv, "adv_acc": ep_adv_acc, "lambda": lambda_at(step)})
+            wm.update({"adv/loss": ep_adv, "adv/acc": ep_adv_acc, "adv/lambda": lambda_at(step)})
+            adv_str = f"  adv_loss={ep_adv:.3f}  adv_acc={ep_adv_acc:.3f}  lam={lambda_at(step):.2f}"
         with open(log_path, "a") as f:
             f.write(json.dumps(rec) + "\n")
-        print(f"  epoch {epoch:3d}  loss={ep_loss:.4f}  lr={lr_at(step):.2e}  "
-              f"({rec['elapsed_min']:.1f} min)")
-        _wandb_log(wandb_run, {"train/loss": ep_loss, "train/lr": lr_at(step),
-                               "epoch": epoch}, step)
+        print(f"  epoch {epoch:3d}  loss={ep_loss:.4f}  con={ep_con:.4f}"
+              f"{adv_str}  ({rec['elapsed_min']:.1f} min)")
+        _wandb_log(wandb_run, wm, step)
 
         # checkpoint each epoch (last) — cheap, and resumable
         torch.save({"model_state": model.state_dict(),
