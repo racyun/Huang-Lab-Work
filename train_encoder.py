@@ -50,6 +50,33 @@ from models.neighborhood_encoder import NeighborhoodEncoder, nt_xent_loss
 DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 
 
+def _init_wandb(args):
+    """Start a W&B run if --wandb is set. Safe no-op if wandb missing/disabled."""
+    if not args.wandb:
+        return None
+    try:
+        import os
+        import wandb
+    except ImportError:
+        print("[wandb] not installed (pip install wandb); continuing without logging.")
+        return None
+    try:
+        key = os.environ.get("WANDB_API_KEY")
+        if key:
+            wandb.login(key=key)
+        return wandb.init(project=args.wandb_project, entity=args.wandb_entity or None,
+                          name=args.wandb_run_name, tags=["stage3", "encoder"],
+                          config=vars(args))
+    except Exception as e:
+        print(f"[wandb] WARNING: could not init ({e}); continuing without logging.")
+        return None
+
+
+def _wandb_log(run, metrics: dict, step: int) -> None:
+    if run is not None:
+        run.log(metrics, step=step)
+
+
 def _default_local_root() -> Path:
     default = Path("/teamspace/studios/this_studio/cellpose_work")
     if "CELLPOSE_LOCAL_ROOT" in os.environ:
@@ -202,6 +229,10 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--push-to-drive", action="store_true")
+    ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
+    ap.add_argument("--wandb-project", default="huang-lab-stage3")
+    ap.add_argument("--wandb-entity", default=None)
+    ap.add_argument("--wandb-run-name", default=None)
     args = ap.parse_args()
 
     torch.manual_seed(0); random.seed(0); np.random.seed(0)
@@ -243,6 +274,10 @@ def main() -> None:
     log_path = stage3 / "train_log.jsonl"
     log_path.write_text("")
 
+    wandb_run = _init_wandb(args)
+    if wandb_run is not None:
+        print(f"[wandb] logging to {args.wandb_project}")
+
     print(f"Training {args.epochs} epochs x {steps_per_epoch} steps "
           f"(batch {args.batch_size}, {len(ds)} samples/epoch)")
     step = 0
@@ -259,6 +294,9 @@ def main() -> None:
             loss = nt_xent_loss(z1, z2, temperature=args.temperature)
             opt.zero_grad(); loss.backward(); opt.step()
             ep_loss += loss.item(); nb += 1; step += 1
+            if step % 10 == 0:
+                _wandb_log(wandb_run, {"train/step_loss": loss.item(),
+                                       "train/lr": lr_at(step)}, step)
 
         ep_loss /= max(1, nb)
         rec = {"epoch": epoch, "loss": ep_loss, "lr": lr_at(step),
@@ -267,6 +305,8 @@ def main() -> None:
             f.write(json.dumps(rec) + "\n")
         print(f"  epoch {epoch:3d}  loss={ep_loss:.4f}  lr={lr_at(step):.2e}  "
               f"({rec['elapsed_min']:.1f} min)")
+        _wandb_log(wandb_run, {"train/loss": ep_loss, "train/lr": lr_at(step),
+                               "epoch": epoch}, step)
 
         # checkpoint each epoch (last) — cheap, and resumable
         torch.save({"model_state": model.state_dict(),
@@ -277,6 +317,8 @@ def main() -> None:
                    stage3 / "encoder.pt")
 
     print(f"\nDone. Encoder -> {stage3 / 'encoder.pt'}")
+    if wandb_run is not None:
+        wandb_run.finish()
     if args.push_to_drive:
         print("Pushing stage3/ to Drive...")
         push_to_drive(stage3)
