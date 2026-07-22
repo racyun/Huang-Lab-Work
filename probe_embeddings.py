@@ -105,6 +105,30 @@ def main() -> None:
         print(f"  {name:<14} acc={acc:.3f} (chance={chance:.3f})")
 
     best_acc = max(r["accuracy"] for r in results.values())
+
+    # ---- EndMT-RETENTION: how well can endmt_score be recovered from h? ----
+    # High R2 = biology preserved in the embedding. Read alongside the leak: the
+    # goal is LOW condition-accuracy AND HIGH endmt-R2 (methodology §D).
+    endmt_r2 = None
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.ensemble import RandomForestRegressor
+        master = pd.read_csv(args.master_table,
+                             usecols=["image_id", "condition", "cell_id", "endmt_score"])
+        merged = df.merge(master, on=["image_id", "condition", "cell_id"], how="left")
+        yv = merged["endmt_score"].to_numpy(dtype=np.float32)
+        ok = np.isfinite(yv)
+        if ok.sum() > 100:
+            print("\nEndMT-retention (predict endmt_score from embeddings)...")
+            endmt_r2 = {}
+            for name, reg in [("ridge", Ridge(alpha=1.0)),
+                              ("random_forest", RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=0))]:
+                r2 = float(cross_val_score(reg, X[ok], yv[ok], cv=3, scoring="r2", n_jobs=-1).mean())
+                endmt_r2[name] = r2
+                print(f"  {name:<14} R2={r2:.3f}")
+    except Exception as e:
+        print(f"[endmt-retention] skipped ({e})")
+
     # verdict heuristic: well above chance -> leakage -> add adversary
     ratio = best_acc / chance
     if ratio >= 2.0 and best_acc >= 0.5:
@@ -123,8 +147,12 @@ def main() -> None:
         "probe": results,
         "best_accuracy": best_acc,
         "accuracy_over_chance": ratio,
+        "endmt_retention_r2": endmt_r2,
         "verdict": verdict,
     }
+    if endmt_r2 is not None:
+        print(f"EndMT-retention R2 (best): {max(endmt_r2.values()):.3f}  "
+              f"(higher = biology better preserved)")
     (args.out_dir / "probe_report.json").write_text(json.dumps(report, indent=2))
     print(f"Wrote {args.out_dir / 'probe_report.json'}")
 

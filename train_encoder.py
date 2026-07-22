@@ -46,8 +46,15 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import k_hop_subgraph
 
 from models.neighborhood_encoder import (
-    NeighborhoodEncoder, ConditionAdversary, nt_xent_loss,
+    NeighborhoodEncoder, ConditionAdversary, EndMTHead,
+    nt_xent_loss, batchnorm_intensities_,
 )
+
+INTENSITY_COLS = [
+    "ch1_cellwise_mean_intensity",
+    "ch2_cellwise_mean_membrane_intensity",
+    "ch3_cellwise_mean_intensity",
+]
 
 DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 
@@ -163,9 +170,11 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
     many neighborhoods are drawn per epoch (a subset of the full ~1.27M).
     """
 
-    def __init__(self, graph_paths, hops=2, samples_per_epoch=None, aug_kwargs=None):
+    def __init__(self, graph_paths, hops=2, samples_per_epoch=None, aug_kwargs=None,
+                 endmt_idx=None, batchnorm_cols=None):
         self.hops = hops
         self.aug_kwargs = aug_kwargs or {}
+        self.endmt_idx = endmt_idx                 # feature index of endmt_score (or None)
         self._graph_cache: dict[str, Data] = {}
         # build (path, center) index over all cells that have neighbors
         self.index: list[tuple[str, int]] = []
@@ -174,6 +183,8 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
             g = torch.load(p, weights_only=False)
             if g.edge_index.shape[1] == 0:
                 continue
+            if batchnorm_cols:                     # per-image intensity batch-norm
+                batchnorm_intensities_(g.x, batchnorm_cols)
             self._graph_cache[p] = g
             conds.add(g.condition)
             deg = torch.bincount(g.edge_index[0], minlength=g.num_nodes)
@@ -194,10 +205,15 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
     def __getitem__(self, i):
         # random draw each call (i is ignored beyond bounding the epoch length)
         path, center = self.index[random.randrange(len(self.index))]
-        sub = extract_neighborhood(self._graph_cache[path], center, self.hops)
+        g = self._graph_cache[path]
+        sub = extract_neighborhood(g, center, self.hops)
         cond = self._path_cond[path]
+        # center cell's EndMT score, taken BEFORE augmentation (clean target)
+        endmt = float(g.x[center, self.endmt_idx]) if self.endmt_idx is not None else 0.0
         va, vb = augment(sub, **self.aug_kwargs), augment(sub, **self.aug_kwargs)
-        va.y = torch.tensor([cond]); vb.y = torch.tensor([cond])   # condition label
+        for v in (va, vb):
+            v.y = torch.tensor([cond])                       # condition label
+            v.endmt = torch.tensor([endmt], dtype=torch.float)  # EndMT target
         return va, vb
 
 
@@ -250,6 +266,18 @@ def main() -> None:
                     help="DANN lambda-ramp steepness")
     ap.add_argument("--adv-hidden", type=int, default=64,
                     help="hidden width of the adversary MLP")
+    ap.add_argument("--adv-layers", type=int, default=1,
+                    help="depth of the adversary MLP (>1 = stronger adversary)")
+    ap.add_argument("--adv-steps", type=int, default=1,
+                    help="adversary-only update steps per batch (>1 = stronger adversary)")
+    # ----- EndMT-retention head (methodology §A) -----
+    ap.add_argument("--endmt-head", action="store_true",
+                    help="add an EndMT regression head to anchor biology in the embedding")
+    ap.add_argument("--endmt-weight", type=float, default=1.0,
+                    help="weight of the EndMT regression loss")
+    # ----- input-level batch correction (methodology §C) -----
+    ap.add_argument("--batch-norm-features", action="store_true",
+                    help="per-image standardize intensity channels to remove batch offsets")
     ap.add_argument("--push-to-drive", action="store_true")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="huang-lab-stage3")
@@ -268,9 +296,25 @@ def main() -> None:
         raise SystemExit(f"no graphs found under {args.graphs_dir}; run build_graphs.py first.")
     print(f"Loading {len(graph_paths)} image graphs...")
 
-    in_dim = torch.load(graph_paths[0], weights_only=False).x.shape[1]
+    g0 = torch.load(graph_paths[0], weights_only=False)
+    in_dim = g0.x.shape[1]
+
+    # resolve feature-column indices from feature_names.json (for endmt + batch-norm)
+    endmt_idx = None; batchnorm_cols = None
+    fn_path = args.graphs_dir / "feature_names.json"
+    if fn_path.exists():
+        feat_names = json.loads(fn_path.read_text())
+        if "endmt_score" in feat_names:
+            endmt_idx = feat_names.index("endmt_score")
+        if args.batch_norm_features:
+            batchnorm_cols = [feat_names.index(c) for c in INTENSITY_COLS if c in feat_names]
+            print(f"  batch-norm ON — per-image standardizing columns {batchnorm_cols}")
+    if args.endmt_head and endmt_idx is None:
+        raise SystemExit("--endmt-head needs endmt_score in feature_names.json")
+
     ds = ContrastiveNeighborhoods(graph_paths, hops=args.hops,
-                                  samples_per_epoch=args.samples_per_epoch)
+                                  samples_per_epoch=args.samples_per_epoch,
+                                  endmt_idx=endmt_idx, batchnorm_cols=batchnorm_cols)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, collate_fn=paired_collate,
                         drop_last=True, persistent_workers=args.num_workers > 0)
@@ -279,16 +323,28 @@ def main() -> None:
                                 emb_dim=args.emb_dim, heads=args.heads,
                                 edge_dim=4, dropout=args.dropout).to(device)
 
+    # ----- EndMT-retention head (optional): anchors biology, trained normally -----
+    endmt_head = None
+    enc_params = list(model.parameters())
+    if args.endmt_head:
+        endmt_head = EndMTHead(args.emb_dim, hidden=args.adv_hidden).to(device)
+        enc_params += list(endmt_head.parameters())
+        print(f"  EndMT-retention head ON — weight {args.endmt_weight}")
+
     # ----- adversary (optional): predicts condition from h through a GRL -----
     adversary = None
-    params = list(model.parameters())
     if args.adversarial:
         adversary = ConditionAdversary(args.emb_dim, len(ds.conditions),
-                                       hidden=args.adv_hidden).to(device)
-        params += list(adversary.parameters())
+                                       hidden=args.adv_hidden, layers=args.adv_layers).to(device)
+        # default (adv_steps==1): adversary trained in the combined GRL step (as before).
+        # adv_steps>1 adds extra adversary-only updates via a separate optimizer.
+        enc_params += list(adversary.parameters())
         print(f"  adversarial scrubbing ON — {len(ds.conditions)} conditions, "
-              f"lambda ramps 0 -> {args.adv_lambda_max}")
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+              f"lambda 0->{args.adv_lambda_max}, adv_layers={args.adv_layers}, "
+              f"adv_steps={args.adv_steps}")
+    opt = torch.optim.AdamW(enc_params, lr=args.lr, weight_decay=args.weight_decay)
+    adv_opt = (torch.optim.AdamW(adversary.parameters(), lr=args.lr)
+               if (adversary is not None and args.adv_steps > 1) else None)
 
     steps_per_epoch = max(1, len(ds) // args.batch_size)
     total_steps = args.epochs * steps_per_epoch
@@ -318,13 +374,16 @@ def main() -> None:
     print(f"Training {args.epochs} epochs x {steps_per_epoch} steps "
           f"(batch {args.batch_size}, {len(ds)} samples/epoch)")
     ce = torch.nn.CrossEntropyLoss()
+    mse = torch.nn.MSELoss()
     step = 0
     t0 = time.time()
     for epoch in range(args.epochs):
         model.train()
         if adversary is not None:
             adversary.train()
-        ep_loss = 0.0; ep_con = 0.0; ep_adv = 0.0; ep_adv_acc = 0.0; nb = 0
+        if endmt_head is not None:
+            endmt_head.train()
+        ep_loss = ep_con = ep_adv = ep_adv_acc = ep_endmt = 0.0; nb = 0
         for view_a, view_b in loader:
             for grp in opt.param_groups:
                 grp["lr"] = lr_at(step)
@@ -333,50 +392,72 @@ def main() -> None:
             h2, z2 = model(view_b)
             loss_con = nt_xent_loss(z1, z2, temperature=args.temperature)
             loss = loss_con
+            h = torch.cat([h1, h2], dim=0)                      # both views
 
+            # ----- EndMT-retention head (anchors biology; no reversal) -----
+            endmt_val = 0.0
+            if endmt_head is not None:
+                tgt = torch.cat([view_a.endmt, view_b.endmt], dim=0).view(-1)
+                loss_endmt = mse(endmt_head(h), tgt)
+                loss = loss + args.endmt_weight * loss_endmt
+                endmt_val = loss_endmt.item()
+
+            # ----- adversary -----
             lam = 0.0; loss_adv_val = 0.0; adv_acc = 0.0
             if adversary is not None:
                 lam = lambda_at(step)
-                h = torch.cat([h1, h2], dim=0)                 # both views
                 y = torch.cat([view_a.y, view_b.y], dim=0).view(-1)
-                logits = adversary(h, lam)                     # GRL inside
+                # extra adversary-only updates (strengthen the spy) if adv_steps>1
+                if adv_opt is not None:
+                    for _ in range(args.adv_steps - 1):
+                        la = ce(adversary(h.detach(), 1.0), y)
+                        adv_opt.zero_grad(); la.backward(); adv_opt.step()
+                logits = adversary(h, lam)                      # GRL flips enc. gradient
                 loss_adv = ce(logits, y)
-                loss = loss_con + loss_adv                     # GRL flips enc. gradient
+                loss = loss + loss_adv
                 loss_adv_val = loss_adv.item()
                 adv_acc = (logits.argmax(1) == y).float().mean().item()
 
             opt.zero_grad(); loss.backward(); opt.step()
             ep_loss += loss.item(); ep_con += loss_con.item()
-            ep_adv += loss_adv_val; ep_adv_acc += adv_acc; nb += 1; step += 1
+            ep_adv += loss_adv_val; ep_adv_acc += adv_acc; ep_endmt += endmt_val
+            nb += 1; step += 1
             if step % 10 == 0:
                 m = {"train/step_loss": loss.item(), "train/lr": lr_at(step)}
                 if adversary is not None:
                     m.update({"adv/lambda": lam, "adv/step_loss": loss_adv_val,
                               "adv/step_acc": adv_acc})
+                if endmt_head is not None:
+                    m["endmt/step_loss"] = endmt_val
                 _wandb_log(wandb_run, m, step)
 
         ep_loss /= max(1, nb); ep_con /= max(1, nb)
-        ep_adv /= max(1, nb); ep_adv_acc /= max(1, nb)
+        ep_adv /= max(1, nb); ep_adv_acc /= max(1, nb); ep_endmt /= max(1, nb)
         rec = {"epoch": epoch, "loss": ep_loss, "con_loss": ep_con,
                "lr": lr_at(step), "elapsed_min": round((time.time() - t0) / 60, 2)}
         wm = {"train/loss": ep_loss, "train/con_loss": ep_con,
               "train/lr": lr_at(step), "epoch": epoch}
-        adv_str = ""
+        extra = ""
         if adversary is not None:
             rec.update({"adv_loss": ep_adv, "adv_acc": ep_adv_acc, "lambda": lambda_at(step)})
             wm.update({"adv/loss": ep_adv, "adv/acc": ep_adv_acc, "adv/lambda": lambda_at(step)})
-            adv_str = f"  adv_loss={ep_adv:.3f}  adv_acc={ep_adv_acc:.3f}  lam={lambda_at(step):.2f}"
+            extra += f"  adv_acc={ep_adv_acc:.3f}  lam={lambda_at(step):.2f}"
+        if endmt_head is not None:
+            rec["endmt_loss"] = ep_endmt
+            wm["endmt/loss"] = ep_endmt
+            extra += f"  endmt_mse={ep_endmt:.3f}"
         with open(log_path, "a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"  epoch {epoch:3d}  loss={ep_loss:.4f}  con={ep_con:.4f}"
-              f"{adv_str}  ({rec['elapsed_min']:.1f} min)")
+              f"{extra}  ({rec['elapsed_min']:.1f} min)")
         _wandb_log(wandb_run, wm, step)
 
         # checkpoint each epoch (last) — cheap, and resumable
         torch.save({"model_state": model.state_dict(),
                     "config": {"in_dim": in_dim, "hidden_dim": args.hidden_dim,
                                "emb_dim": args.emb_dim, "heads": args.heads,
-                               "edge_dim": 4, "dropout": args.dropout},
+                               "edge_dim": 4, "dropout": args.dropout,
+                               "batch_norm_features": args.batch_norm_features},
                     "epoch": epoch, "loss": ep_loss},
                    stage3 / "encoder.pt")
 

@@ -39,23 +39,64 @@ def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
 
 
 class ConditionAdversary(nn.Module):
-    """Small MLP that predicts `condition` from the embedding, through a GRL.
+    """MLP that predicts `condition` from the embedding, through a GRL.
 
     Forward multiplies the incoming gradient by -lambd (via the GRL) so the
     encoder is trained to make `condition` UNpredictable, while the adversary
     itself still learns to predict it as well as it can. Returns class logits.
+
+    ``layers`` controls depth (>=1): a stronger adversary forces the encoder to
+    scrub the confound harder to fool it (methodology §B).
     """
 
-    def __init__(self, emb_dim: int, n_conditions: int, hidden: int = 64):
+    def __init__(self, emb_dim: int, n_conditions: int, hidden: int = 64, layers: int = 1):
+        super().__init__()
+        mods: list[nn.Module] = []
+        d = emb_dim
+        for _ in range(max(1, layers) - 1):
+            mods += [nn.Linear(d, hidden), nn.ReLU(inplace=True)]
+            d = hidden
+        mods.append(nn.Linear(d, n_conditions))
+        self.net = nn.Sequential(*mods)
+
+    def forward(self, h: torch.Tensor, lambd: float) -> torch.Tensor:
+        return self.net(grad_reverse(h, lambd))
+
+
+class EndMTHead(nn.Module):
+    """Small MLP that predicts a neighborhood's EndMT score from the embedding.
+
+    Trained NORMALLY (no gradient reversal) to actively anchor the EndMT signal
+    in the embedding, so adversarial condition-scrubbing can't drag the biology
+    out along with the confound. Returns a scalar per graph.
+    """
+
+    def __init__(self, emb_dim: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(emb_dim, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, n_conditions),
+            nn.Linear(hidden, 1),
         )
 
-    def forward(self, h: torch.Tensor, lambd: float) -> torch.Tensor:
-        return self.net(grad_reverse(h, lambd))
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h).squeeze(-1)
+
+
+def batchnorm_intensities_(x: torch.Tensor, cols: list[int]) -> torch.Tensor:
+    """Per-image standardize the given (intensity) feature columns, in place.
+
+    Removes per-image illumination/staining offsets (a batch confound) at the
+    input, so the encoder never sees them. Self-contained per graph, so train
+    and inference stay consistent without global stats. Returns x.
+    """
+    if not cols:
+        return x
+    sub = x[:, cols]
+    mean = sub.mean(dim=0, keepdim=True)
+    std = sub.std(dim=0, keepdim=True)
+    x[:, cols] = (sub - mean) / (std + 1e-6)
+    return x
 
 
 class NeighborhoodEncoder(nn.Module):

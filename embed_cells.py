@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -36,9 +37,15 @@ import torch
 from torch_geometric.data import Batch, Data
 from torch_geometric.utils import k_hop_subgraph
 
-from models.neighborhood_encoder import NeighborhoodEncoder
+from models.neighborhood_encoder import NeighborhoodEncoder, batchnorm_intensities_
 
 DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
+
+INTENSITY_COLS = [
+    "ch1_cellwise_mean_intensity",
+    "ch2_cellwise_mean_membrane_intensity",
+    "ch3_cellwise_mean_intensity",
+]
 
 
 def _default_local_root() -> Path:
@@ -72,7 +79,7 @@ def load_encoder(ckpt_path: Path, device) -> NeighborhoodEncoder:
     model.eval()
     print(f"Loaded encoder (epoch {ckpt.get('epoch')}, loss {ckpt.get('loss'):.4f}); "
           f"emb_dim={cfg['emb_dim']}")
-    return model, cfg["emb_dim"]
+    return model, cfg["emb_dim"], cfg
 
 
 def cellids_for_graph(master: pd.DataFrame, condition: str, image_id: str, n: int):
@@ -102,7 +109,15 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    model, emb_dim = load_encoder(args.encoder, device)
+    model, emb_dim, ckpt_cfg = load_encoder(args.encoder, device)
+
+    # match the training-time input transform (per-image intensity batch-norm)
+    batchnorm_cols = None
+    if ckpt_cfg.get("batch_norm_features"):
+        fn_path = args.graphs_dir / "feature_names.json"
+        feat_names = json.loads(fn_path.read_text())
+        batchnorm_cols = [feat_names.index(c) for c in INTENSITY_COLS if c in feat_names]
+        print(f"  applying per-image batch-norm to columns {batchnorm_cols} (matches training)")
 
     master = pd.read_csv(args.master_table, usecols=["image_id", "condition", "cell_id"])
     graph_paths = sorted(glob.glob(str(args.graphs_dir / "*" / "*.pt")))
@@ -127,6 +142,8 @@ def main() -> None:
     n_cells = 0
     for gi, p in enumerate(graph_paths):
         g = torch.load(p, weights_only=False)
+        if batchnorm_cols:
+            batchnorm_intensities_(g.x, batchnorm_cols)
         cond, img = g.condition, g.image_id
         cids = cellids_for_graph(master, cond, img, g.num_nodes)
         for c in range(g.num_nodes):
