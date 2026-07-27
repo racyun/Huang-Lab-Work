@@ -429,6 +429,8 @@ def main() -> None:
           f"(batch {args.batch_size}, {len(ds)} samples/epoch)")
     ce = torch.nn.CrossEntropyLoss()
     mse = torch.nn.MSELoss()
+    best_scrub = float("inf")          # |adv_acc - chance|, lower = better scrubbed
+    adv_chance = 1.0 / max(1, len(ds.conditions))
     step = 0
     t0 = time.time()
     for epoch in range(args.epochs):
@@ -441,6 +443,14 @@ def main() -> None:
         for view_a, view_b in loader:
             for grp in opt.param_groups:
                 grp["lr"] = lr_at(step)
+            # BUGFIX: the adversary's own optimizer must follow the SAME schedule.
+            # Previously its LR stayed pinned at args.lr while the encoder's decayed
+            # to ~0, so in the final epochs the encoder was effectively frozen while
+            # the adversary kept training at full speed — it won by default, and the
+            # last-epoch checkpoint captured the encoder at its worst.
+            if adv_opt is not None:
+                for grp in adv_opt.param_groups:
+                    grp["lr"] = lr_at(step)
             view_a = view_a.to(device); view_b = view_b.to(device)
             h1, z1 = model(view_a)
             h2, z2 = model(view_b)
@@ -516,6 +526,25 @@ def main() -> None:
                                "intensity_jitter": args.intensity_jitter},
                     "epoch": epoch, "loss": ep_loss},
                    stage3 / "encoder.pt")
+
+        # Track the best-scrubbed epoch: adversary accuracy closest to chance.
+        # Only consider epochs where lambda has substantially ramped, otherwise an
+        # early epoch wins simply because the adversary hasn't learned yet.
+        if adversary is not None and lambda_at(step) >= 0.5 * args.adv_lambda_max:
+            scrub = abs(ep_adv_acc - adv_chance)
+            if scrub < best_scrub:
+                best_scrub = scrub
+                torch.save({"model_state": model.state_dict(),
+                            "config": {"in_dim": in_dim, "hidden_dim": args.hidden_dim,
+                                       "emb_dim": args.emb_dim, "heads": args.heads,
+                                       "edge_dim": 4, "dropout": args.dropout,
+                                       "batch_norm_features": args.batch_norm_features,
+                                       "adv_target": args.adv_target,
+                                       "intensity_jitter": args.intensity_jitter},
+                            "epoch": epoch, "loss": ep_loss, "adv_acc": ep_adv_acc},
+                           stage3 / "encoder_best.pt")
+                print(f"    ^ best scrub so far (adv_acc={ep_adv_acc:.3f} "
+                      f"vs chance {adv_chance:.3f}) -> encoder_best.pt")
 
     print(f"\nDone. Encoder -> {stage3 / 'encoder.pt'}")
     if wandb_run is not None:
