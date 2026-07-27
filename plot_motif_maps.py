@@ -15,8 +15,11 @@ Inputs:
     optionally <root>/imgs/<condition>/tiles/<image_id>.tif  (--overlay)
 
 Outputs:
-    <out>/motif_map_grid.png       one panel per selected image, shared legend
-    <out>/motif_map_<cond>__<img>.png   individual full-size maps
+    <out>/motif_map_<cond>__<img>.png   two panels per image:
+                                        LEFT = motif map, RIGHT = original tile
+    <out>/motif_map_grid.png            motif maps only, one panel per image
+                                        with a shared legend (cross-condition
+                                        comparison)
 
 Usage:
     python plot_motif_maps.py --motifs <stage4>/motifs.parquet
@@ -145,30 +148,46 @@ def main() -> None:
         # rows are in node order (embed_cells walked cells 0..n-1 per graph)
         motifs_for_image = sub["motif"].to_numpy()
 
+        # Always try to load the raw tile — the right-hand panel shows it, and
+        # --overlay additionally draws the motif map on top of it on the left.
         raw = None
-        if args.overlay:
-            try:
-                import tifffile
-                tiles = args.imgs_dir / cond / "tiles"
-                p = tiles / f"{img_id}.tif"
-                if not p.exists():
-                    cands = sorted(tiles.glob(f"{img_id}.*")) or sorted(tiles.glob(f"{img_id}*"))
-                    p = cands[0] if cands else None
-                if p is not None:
-                    raw = tifffile.imread(str(p))
-            except Exception as e:
-                print(f"  [warn] overlay unavailable for {img_id}: {e}")
+        try:
+            import tifffile
+            tiles = args.imgs_dir / cond / "tiles"
+            p = tiles / f"{img_id}.tif"
+            if not p.exists():
+                cands = sorted(tiles.glob(f"{img_id}.*")) or sorted(tiles.glob(f"{img_id}*"))
+                p = cands[0] if cands else None
+            if p is not None:
+                raw = tifffile.imread(str(p))
+            else:
+                print(f"  [warn] no raw tile found for {img_id}")
+        except Exception as e:
+            print(f"  [warn] raw tile unavailable for {img_id}: {e}")
 
-        # individual full-size map
-        fig, ax = plt.subplots(figsize=(9, 9))
-        draw_map(ax, g, motifs_for_image, colors, raw, node_size=36,
-                 show_edges=not args.no_edges)
-        ax.set_title(f"{cond} / {img_id}   ({g.num_nodes} cells)", fontsize=11)
+        # individual figure: LEFT = motif map, RIGHT = original image
         handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[m],
                           markeredgecolor="black", markersize=9, label=f"motif {m}")
                    for m in range(n_motifs)]
-        ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
-                  fontsize=9, frameon=False)
+        if raw is not None:
+            fig, (axL, axR) = plt.subplots(1, 2, figsize=(18, 9))
+            draw_map(axL, g, motifs_for_image, colors,
+                     raw if args.overlay else None, node_size=36,
+                     show_edges=not args.no_edges)
+            axL.set_title(f"Motif map — {g.num_nodes} cells", fontsize=11)
+            axR.imshow(_composite(raw))
+            axR.set_title("Original image (R=TAGLN, G=VE-cad, B=DAPI)", fontsize=11)
+            axR.axis("off")
+            axL.legend(handles=handles, loc="upper left", bbox_to_anchor=(0, -0.02),
+                       ncol=min(n_motifs, 6), fontsize=9, frameon=False)
+            fig.suptitle(f"{cond} / {img_id}", fontsize=13)
+        else:                                    # no tile available -> single panel
+            fig, axL = plt.subplots(figsize=(9, 9))
+            draw_map(axL, g, motifs_for_image, colors, None, node_size=36,
+                     show_edges=not args.no_edges)
+            axL.set_title(f"{cond} / {img_id}   ({g.num_nodes} cells)", fontsize=11)
+            axL.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
+                       fontsize=9, frameon=False)
         fig.tight_layout()
         fname = out_dir / f"motif_map_{cond}__{img_id}.png"
         fig.savefig(fname, dpi=140, bbox_inches="tight")
@@ -186,8 +205,8 @@ def main() -> None:
             ax.axis("off")
         for k, (cond, img_id, g, mfi, raw) in enumerate(panels):
             ax = axes[k // ncol][k % ncol]
-            draw_map(ax, g, mfi, colors, raw, node_size=18,
-                     show_edges=not args.no_edges)
+            draw_map(ax, g, mfi, colors, raw if args.overlay else None,
+                     node_size=18, show_edges=not args.no_edges)
             ax.set_title(f"{cond}\n{img_id}", fontsize=10)
         handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[m],
                           markeredgecolor="black", markersize=10, label=f"motif {m}")
