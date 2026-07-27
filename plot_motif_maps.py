@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """Stage 4 visualisation — paint motif labels back onto the tissue.
 
-Produces "cluster maps": the Stage 2 spatial graph for an image, with each cell
-coloured by the motif it was assigned. This is the final step of the project
-doc (Step 6): "colour the tissue image by motif label to see where different
-motifs appear spatially."
+Produces three kinds of figure:
 
-Motif colours are FIXED across every panel and every image, so a motif is the
-same colour everywhere and panels can be compared directly.
+  1. PER-IMAGE TWO-PANEL   motif_map_<cond>__<img>.png
+     LEFT = motif map (cells coloured by motif), RIGHT = the original tile.
 
-Inputs:
-    <stage4>/motifs.parquet                (from cluster_motifs.py)
-    <root>/graphs/<condition>/<image_id>.pt  (Stage 2 graphs: pos + edges)
-    optionally <root>/imgs/<condition>/tiles/<image_id>.tif  (--overlay)
+  2. PAIRED GRIDS          motif_map_grid_part<N>.png
+     3 conditions per figure, 2 rows x 3 columns: top row the motif maps,
+     bottom row the matching original images directly beneath each map.
 
-Outputs:
-    <out>/motif_map_<cond>__<img>.png   two panels per image:
-                                        LEFT = motif map, RIGHT = original tile
-    <out>/motif_map_grid.png            motif maps only, one panel per image
-                                        with a shared legend (cross-condition
-                                        comparison)
+  3. PER-MOTIF BREAKDOWN   motif_breakdown_<cond>__<img>.png
+     One panel per motif for a single image, showing only that motif's cells,
+     coloured by EndMT score (other cells shown faint grey for context).
+
+Motif colours are fixed by motif id across every panel and image.
 
 Usage:
-    python plot_motif_maps.py --motifs <stage4>/motifs.parquet
-    python plot_motif_maps.py --images-per-condition 2 --overlay
+    python plot_motif_maps.py --motifs <stage4>/motifs.parquet \
+        --graphs-dir <root>/graphs --imgs-dir <root>/imgs
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -39,6 +35,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+
+VERSION = "2026-07-27 two-panel + paired-grid + per-motif-EndMT"
+IMG_EXTS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
 
 def _default_local_root() -> Path:
@@ -51,7 +50,6 @@ def _default_local_root() -> Path:
 
 
 def motif_colors(n_motifs: int):
-    """Fixed colour per motif id, consistent across every image drawn."""
     base = plt.cm.tab10 if n_motifs <= 10 else plt.cm.tab20
     return [base(i % base.N) for i in range(n_motifs)]
 
@@ -62,7 +60,7 @@ def _stretch(ch):
 
 
 def _composite(im):
-    """R=TAGLN(ch3), G=VE-cad(ch2), B=DAPI(ch1) — matches the other viewers."""
+    """R=TAGLN(ch3), G=VE-cad(ch2), B=DAPI(ch1)."""
     if im.ndim == 2:
         s = _stretch(im)
         return np.dstack([s, s, s])
@@ -73,9 +71,48 @@ def _composite(im):
     return rgb
 
 
+def find_tile(imgs_dir: Path, cond: str, img_id: str, diagnose: bool = True):
+    """Locate the raw tile, trying several layouts, and SAY why if it fails."""
+    searched = []
+    for folder in (imgs_dir / cond / "tiles", imgs_dir / cond, imgs_dir):
+        searched.append(folder)
+        if not folder.exists():
+            continue
+        for ext in IMG_EXTS:                       # exact name first
+            p = folder / f"{img_id}{ext}"
+            if p.exists():
+                return p
+        hits = sorted(folder.glob(f"{img_id}.*")) or sorted(folder.glob(f"{img_id}*"))
+        if hits:
+            return hits[0]
+    if diagnose:
+        print(f"    [tile NOT FOUND] image_id='{img_id}' condition='{cond}'")
+        for folder in searched:
+            if folder.exists():
+                try:
+                    names = [p.name for p in sorted(folder.iterdir())[:5]]
+                except Exception as e:
+                    names = [f"(unreadable: {e})"]
+                print(f"      searched {folder}  ->  exists, e.g. {names}")
+            else:
+                print(f"      searched {folder}  ->  DOES NOT EXIST")
+    return None
+
+
+def load_tile(imgs_dir: Path, cond: str, img_id: str):
+    p = find_tile(imgs_dir, cond, img_id)
+    if p is None:
+        return None
+    try:
+        import tifffile
+        return tifffile.imread(str(p))
+    except Exception as e:
+        print(f"    [tile READ FAILED] {p}: {e}")
+        return None
+
+
 def draw_map(ax, g, motifs_for_image, colors, overlay_img=None, node_size=28,
              show_edges=True):
-    """Draw one image's graph with nodes coloured by motif."""
     pos = g.pos.numpy()
     if overlay_img is not None:
         ax.imshow(_composite(overlay_img))
@@ -86,13 +123,36 @@ def draw_map(ax, g, motifs_for_image, colors, overlay_img=None, node_size=28,
         for s, d in ei.T:
             ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
                     lw=0.35, color=edge_col, alpha=alpha, zorder=1)
-    node_cols = [colors[m] for m in motifs_for_image]
-    ax.scatter(pos[:, 0], pos[:, 1], c=node_cols, s=node_size, zorder=2,
-               edgecolors="black", linewidths=0.25)
+    ax.scatter(pos[:, 0], pos[:, 1], c=[colors[m] for m in motifs_for_image],
+               s=node_size, zorder=2, edgecolors="black", linewidths=0.25)
     if overlay_img is None:
-        ax.invert_yaxis()          # imshow already puts row 0 at the top
+        ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.axis("off")
+
+
+def draw_endmt_for_motif(ax, g, motifs_for_image, endmt, motif_id, node_size=26):
+    """One motif in isolation, its cells coloured by EndMT score."""
+    pos = g.pos.numpy()
+    sel = motifs_for_image == motif_id
+    ax.scatter(pos[~sel, 0], pos[~sel, 1], s=node_size * 0.35, color="lightgrey",
+               alpha=0.55, zorder=1)                       # context
+    sc = ax.scatter(pos[sel, 0], pos[sel, 1], c=endmt[sel], cmap="coolwarm",
+                    vmin=0, vmax=1, s=node_size, zorder=2,
+                    edgecolors="black", linewidths=0.3)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+    return sc, int(sel.sum())
+
+
+def endmt_index(graphs_dir: Path):
+    fn = graphs_dir / "feature_names.json"
+    if fn.exists():
+        names = json.loads(fn.read_text())
+        if "endmt_score" in names:
+            return names.index("endmt_score")
+    return None
 
 
 def main() -> None:
@@ -101,27 +161,33 @@ def main() -> None:
     ap.add_argument("--motifs", type=Path, default=root / "stage4" / "motifs.parquet")
     ap.add_argument("--graphs-dir", type=Path, default=root / "graphs")
     ap.add_argument("--imgs-dir", type=Path, default=root / "imgs")
-    ap.add_argument("--out-dir", type=Path, default=None,
-                    help="default: alongside the motifs file")
-    ap.add_argument("--images-per-condition", type=int, default=1,
-                    help="how many images to draw from each condition")
+    ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument("--images-per-condition", type=int, default=1)
     ap.add_argument("--images", nargs="*", default=None,
-                    help="explicit 'condition/image_id' entries instead of auto-select")
+                    help="explicit 'condition/image_id' entries")
+    ap.add_argument("--conditions-per-grid", type=int, default=3,
+                    help="conditions per paired-grid figure (part1, part2, ...)")
     ap.add_argument("--overlay", action="store_true",
-                    help="draw on the raw microscopy tile instead of a blank panel")
-    ap.add_argument("--no-edges", action="store_true", help="hide graph edges")
+                    help="draw the motif map on top of the tile as well")
+    ap.add_argument("--no-edges", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    print(f"plot_motif_maps.py  [{VERSION}]")
     out_dir = args.out_dir or args.motifs.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mdf = pd.read_parquet(args.motifs)
     n_motifs = int(mdf["motif"].max()) + 1
     colors = motif_colors(n_motifs)
+    e_idx = endmt_index(args.graphs_dir)
     print(f"Loaded {len(mdf)} motif labels across {n_motifs} motifs")
+    print(f"imgs-dir: {args.imgs_dir}  (exists: {args.imgs_dir.exists()})")
+    if e_idx is None:
+        print("  [warn] endmt_score not in feature_names.json -> per-motif "
+              "breakdown will be skipped")
 
-    # ---- choose which images to draw ----
+    # ---- choose images ----
     if args.images:
         picks = [tuple(s.split("/", 1)) for s in args.images]
     else:
@@ -132,9 +198,13 @@ def main() -> None:
             take = rng.choice(imgs, size=min(args.images_per_condition, len(imgs)),
                               replace=False)
             picks += [(cond, i) for i in take]
-    print(f"Drawing {len(picks)} image(s)")
+    print(f"Drawing {len(picks)} image(s)\n")
 
-    panels = []
+    handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[m],
+                      markeredgecolor="black", markersize=9, label=f"motif {m}")
+               for m in range(n_motifs)]
+
+    panels, n_with_tile = [], 0
     for cond, img_id in picks:
         gpath = args.graphs_dir / cond / f"{img_id}.pt"
         if not gpath.exists():
@@ -145,35 +215,17 @@ def main() -> None:
         if len(sub) != g.num_nodes:
             print(f"  [skip] {cond}/{img_id}: {len(sub)} labels vs {g.num_nodes} nodes")
             continue
-        # rows are in node order (embed_cells walked cells 0..n-1 per graph)
-        motifs_for_image = sub["motif"].to_numpy()
+        mfi = sub["motif"].to_numpy()
+        print(f"  {cond}/{img_id}")
+        raw = load_tile(args.imgs_dir, cond, img_id)
+        if raw is not None:
+            n_with_tile += 1
 
-        # Always try to load the raw tile — the right-hand panel shows it, and
-        # --overlay additionally draws the motif map on top of it on the left.
-        raw = None
-        try:
-            import tifffile
-            tiles = args.imgs_dir / cond / "tiles"
-            p = tiles / f"{img_id}.tif"
-            if not p.exists():
-                cands = sorted(tiles.glob(f"{img_id}.*")) or sorted(tiles.glob(f"{img_id}*"))
-                p = cands[0] if cands else None
-            if p is not None:
-                raw = tifffile.imread(str(p))
-            else:
-                print(f"  [warn] no raw tile found for {img_id}")
-        except Exception as e:
-            print(f"  [warn] raw tile unavailable for {img_id}: {e}")
-
-        # individual figure: LEFT = motif map, RIGHT = original image
-        handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[m],
-                          markeredgecolor="black", markersize=9, label=f"motif {m}")
-                   for m in range(n_motifs)]
+        # ---- 1. per-image two-panel figure ----
         if raw is not None:
             fig, (axL, axR) = plt.subplots(1, 2, figsize=(18, 9))
-            draw_map(axL, g, motifs_for_image, colors,
-                     raw if args.overlay else None, node_size=36,
-                     show_edges=not args.no_edges)
+            draw_map(axL, g, mfi, colors, raw if args.overlay else None,
+                     node_size=36, show_edges=not args.no_edges)
             axL.set_title(f"Motif map — {g.num_nodes} cells", fontsize=11)
             axR.imshow(_composite(raw))
             axR.set_title("Original image (R=TAGLN, G=VE-cad, B=DAPI)", fontsize=11)
@@ -181,45 +233,83 @@ def main() -> None:
             axL.legend(handles=handles, loc="upper left", bbox_to_anchor=(0, -0.02),
                        ncol=min(n_motifs, 6), fontsize=9, frameon=False)
             fig.suptitle(f"{cond} / {img_id}", fontsize=13)
-        else:                                    # no tile available -> single panel
+        else:
             fig, axL = plt.subplots(figsize=(9, 9))
-            draw_map(axL, g, motifs_for_image, colors, None, node_size=36,
+            draw_map(axL, g, mfi, colors, None, node_size=36,
                      show_edges=not args.no_edges)
             axL.set_title(f"{cond} / {img_id}   ({g.num_nodes} cells)", fontsize=11)
             axL.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
                        fontsize=9, frameon=False)
         fig.tight_layout()
-        fname = out_dir / f"motif_map_{cond}__{img_id}.png"
-        fig.savefig(fname, dpi=140, bbox_inches="tight")
+        fig.savefig(out_dir / f"motif_map_{cond}__{img_id}.png", dpi=140,
+                    bbox_inches="tight")
         plt.close(fig)
-        print(f"  wrote {fname.name}")
-        panels.append((cond, img_id, g, motifs_for_image, raw))
 
-    # ---- comparison grid: all panels together, shared legend ----
-    if panels:
-        ncol = min(3, len(panels))
-        nrow = int(np.ceil(len(panels) / ncol))
-        fig, axes = plt.subplots(nrow, ncol, figsize=(6 * ncol, 6 * nrow),
-                                 squeeze=False)
+        # ---- 3. per-motif breakdown, coloured by EndMT ----
+        if e_idx is not None:
+            endmt = g.x[:, e_idx].numpy()
+            ncol = int(np.ceil(np.sqrt(n_motifs)))
+            nrow = int(np.ceil(n_motifs / ncol))
+            fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 5 * nrow),
+                                     squeeze=False)
+            for ax in axes.flat:
+                ax.axis("off")
+            sc = None
+            for m in range(n_motifs):
+                ax = axes[m // ncol][m % ncol]
+                sc, cnt = draw_endmt_for_motif(ax, g, mfi, endmt, m)
+                ax.set_title(f"motif {m}  ({cnt} cells, "
+                             f"{100 * cnt / g.num_nodes:.1f}%)", fontsize=11,
+                             color=colors[m])
+            if sc is not None:
+                cbar = fig.colorbar(sc, ax=axes, fraction=0.02, pad=0.02)
+                cbar.set_label("EndMT score (0 = endothelial, 1 = mesenchymal)")
+            fig.suptitle(f"Per-motif breakdown — {cond} / {img_id}\n"
+                         f"each panel shows one motif, cells coloured by EndMT score",
+                         fontsize=13)
+            fig.savefig(out_dir / f"motif_breakdown_{cond}__{img_id}.png", dpi=140,
+                        bbox_inches="tight")
+            plt.close(fig)
+
+        panels.append((cond, img_id, g, mfi, raw))
+
+    print(f"\nTiles found for {n_with_tile}/{len(panels)} image(s)")
+    if n_with_tile == 0 and panels:
+        print("  !! No original images were located — the paths above show where "
+              "we looked. Fix --imgs-dir (expected <imgs-dir>/<condition>/tiles/"
+              "<image_id>.tif) and re-run.")
+
+    # ---- 2. paired grids: one figure per group of conditions ----
+    by_cond: dict[str, tuple] = {}
+    for p in panels:                                   # first image per condition
+        by_cond.setdefault(p[0], p)
+    conds = sorted(by_cond)
+    per = max(1, args.conditions_per_grid)
+    for part, i in enumerate(range(0, len(conds), per), start=1):
+        chunk = [by_cond[c] for c in conds[i:i + per]]
+        ncol = len(chunk)
+        fig, axes = plt.subplots(2, ncol, figsize=(6 * ncol, 12), squeeze=False)
         for ax in axes.flat:
             ax.axis("off")
-        for k, (cond, img_id, g, mfi, raw) in enumerate(panels):
-            ax = axes[k // ncol][k % ncol]
-            draw_map(ax, g, mfi, colors, raw if args.overlay else None,
+        for k, (cond, img_id, g, mfi, raw) in enumerate(chunk):
+            draw_map(axes[0][k], g, mfi, colors, raw if args.overlay else None,
                      node_size=18, show_edges=not args.no_edges)
-            ax.set_title(f"{cond}\n{img_id}", fontsize=10)
-        handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[m],
-                          markeredgecolor="black", markersize=10, label=f"motif {m}")
-                   for m in range(n_motifs)]
+            axes[0][k].set_title(f"{cond}\n{img_id}", fontsize=11)
+            if raw is not None:
+                axes[1][k].imshow(_composite(raw))
+            else:
+                axes[1][k].text(0.5, 0.5, "(original image\nnot found)",
+                                ha="center", va="center", fontsize=11, color="grey")
+            axes[1][k].set_title("original image", fontsize=10)
         fig.legend(handles=handles, loc="lower center", ncol=min(n_motifs, 8),
-                   fontsize=10, frameon=False, bbox_to_anchor=(0.5, -0.02))
-        fig.suptitle("Motif cluster maps — cells coloured by assigned motif",
-                     fontsize=13)
+                   fontsize=10, frameon=False, bbox_to_anchor=(0.5, -0.01))
+        fig.suptitle(f"Motif maps (top) and original images (bottom) — part {part}",
+                     fontsize=14)
         fig.tight_layout()
-        grid = out_dir / "motif_map_grid.png"
-        fig.savefig(grid, dpi=140, bbox_inches="tight")
+        fname = out_dir / f"motif_map_grid_part{part}.png"
+        fig.savefig(fname, dpi=140, bbox_inches="tight")
         plt.close(fig)
-        print(f"\nWrote comparison grid -> {grid}")
+        print(f"Wrote {fname.name}  ({ncol} conditions)")
 
 
 if __name__ == "__main__":
