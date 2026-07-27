@@ -56,6 +56,59 @@ def load_embeddings(path: Path) -> pd.DataFrame:
     raise SystemExit(f"embeddings not found: {path} (or .csv). Run embed_cells.py first.")
 
 
+def parse_condition(cond: str) -> tuple[str, str]:
+    """'260516_500kPa' -> ('260516', '500kPa'). Splits on the first underscore."""
+    date, _, stiffness = str(cond).partition("_")
+    return date, (stiffness or "unknown")
+
+
+def _probe_target(X, y_names, groups, probes, label: str, cv_splits: int = 3):
+    """Run each probe on one target. Returns a results dict.
+
+    Reports BOTH baselines, because they differ under class imbalance:
+      - uniform chance  = 1 / n_classes
+      - majority        = frequency of the most common class (the real floor:
+                          a classifier that always guesses the majority scores this)
+    """
+    from sklearn.model_selection import cross_val_score, GroupKFold
+
+    classes = sorted(pd.unique(y_names))
+    y = np.searchsorted(np.array(classes), y_names)
+    n_groups = len(np.unique(groups))
+    splits = min(cv_splits, n_groups)
+    if len(classes) < 2 or splits < 2:
+        print(f"  [skip] {label}: needs >=2 classes and >=2 image groups")
+        return None
+
+    _, counts = np.unique(y, return_counts=True)
+    majority = float(counts.max() / counts.sum())
+    uniform = 1.0 / len(classes)
+    cv = GroupKFold(n_splits=splits)
+
+    print(f"\n{label}  ({len(classes)} classes: {classes})")
+    print(f"  n={len(y)} cells over {n_groups} images | "
+          f"uniform chance={uniform:.3f}, majority baseline={majority:.3f}")
+    res = {}
+    for name, clf in probes:
+        scores = cross_val_score(clf, X, y, cv=cv, groups=groups,
+                                 scoring="accuracy", n_jobs=-1)
+        res[name] = {"accuracy": float(scores.mean()), "std": float(scores.std())}
+        print(f"  {name:<14} acc={scores.mean():.3f}")
+    strongest = max(res.items(), key=lambda kv: kv[1]["accuracy"])
+    print(f"  -> strongest: {strongest[0]} ({strongest[1]['accuracy']:.3f})"
+          f"  [above majority by {strongest[1]['accuracy'] - majority:+.3f}]")
+    return {
+        "classes": [str(c) for c in classes],
+        "n_cells": int(len(y)),
+        "n_images": int(n_groups),
+        "uniform_chance": uniform,
+        "majority_baseline": majority,
+        "probes": res,
+        "strongest": {"name": strongest[0], "accuracy": strongest[1]["accuracy"]},
+        "above_majority": strongest[1]["accuracy"] - majority,
+    }
+
+
 def main() -> None:
     root = _default_local_root()
     ap = argparse.ArgumentParser(description="Confound probe + UMAP QC (Stage 3).")
@@ -64,6 +117,9 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, default=root / "stage3")
     ap.add_argument("--max-cells", type=int, default=100000,
                     help="subsample this many cells for probe/UMAP (speed)")
+    ap.add_argument("--decompose", action="store_true",
+                    help="split the condition leak into DATE (batch, bad) vs "
+                         "STIFFNESS (biology, legitimate), plus controlled contrasts")
     ap.add_argument("--push-to-drive", action="store_true")
     args = ap.parse_args()
 
@@ -133,6 +189,54 @@ def main() -> None:
     print(f"  -> strongest probe: {strongest[0]} ({strongest_acc:.3f}) "
           f"= upper bound on recoverable condition info")
 
+    # ---- DECOMPOSITION: is the leak batch (bad) or biology (legitimate)? ----
+    # `condition` fuses imaging DATE with STIFFNESS. Only the date part is a
+    # confound worth scrubbing; stiffness-predictability is expected if the
+    # encoder captured real structure. Two extra CONTROLLED contrasts exploit
+    # the partially-crossed design for cleaner reads:
+    #   - within one date, predict stiffness  -> biology with batch held fixed
+    #   - within one stiffness, predict date  -> PURE batch effect (the key number)
+    decomposition = None
+    if args.decompose:
+        print("\n" + "=" * 70)
+        print("DECOMPOSITION — is the leak batch or biology?")
+        print("=" * 70)
+        # RF is excluded here: it underfits 64-d embeddings badly (it read 0.347
+        # where the MLP read 0.731), so it only adds runtime.
+        dprobes = [p for p in probes if p[0] != "random_forest"]
+        dates = np.array([parse_condition(c)[0] for c in y_names])
+        stiffs = np.array([parse_condition(c)[1] for c in y_names])
+
+        decomposition = {
+            "date": _probe_target(X, dates, groups, dprobes,
+                                  "DATE probe (batch — SHOULD be near baseline)"),
+            "stiffness": _probe_target(X, stiffs, groups, dprobes,
+                                       "STIFFNESS probe (biology — high is fine)"),
+            "contrasts": {},
+        }
+
+        # controlled contrast 1: within a single date, can we read stiffness?
+        for d in sorted(pd.unique(dates)):
+            m = dates == d
+            if len(pd.unique(stiffs[m])) >= 2:
+                r = _probe_target(X[m], stiffs[m], groups[m], dprobes,
+                                  f"CONTROLLED: stiffness within date {d} "
+                                  f"(pure biology, batch fixed)")
+                if r:
+                    decomposition["contrasts"][f"stiffness_within_date_{d}"] = r
+
+        # controlled contrast 2: within a single stiffness, can we read date?
+        # THIS is the cleanest batch measurement — same biology, different day.
+        for s in sorted(pd.unique(stiffs)):
+            m = stiffs == s
+            if len(pd.unique(dates[m])) >= 2:
+                r = _probe_target(X[m], dates[m], groups[m], dprobes,
+                                  f"CONTROLLED: date within stiffness {s} "
+                                  f"(PURE BATCH — key number)")
+                if r:
+                    decomposition["contrasts"][f"date_within_stiffness_{s}"] = r
+        print("=" * 70)
+
     # ---- EndMT-RETENTION: how well can endmt_score be recovered from h? ----
     # High R2 = biology preserved in the embedding. Read alongside the leak: the
     # goal is LOW condition-accuracy AND HIGH endmt-R2 (methodology §D).
@@ -187,9 +291,41 @@ def main() -> None:
         "condition_probe": results,
         "strongest_probe": {"name": strongest[0], "accuracy": strongest_acc},
         "accuracy_over_chance": ratio,
+        "decomposition": decomposition,
         "endmt_retention_r2": endmt_r2,
         "verdict": verdict,
     }
+
+    # ---- interpret the decomposition: does a date-adversary need building? ----
+    if decomposition:
+        pure_batch = [(k, v) for k, v in decomposition["contrasts"].items()
+                      if k.startswith("date_within_stiffness")]
+        print("\nDECOMPOSITION SUMMARY")
+        for key in ("date", "stiffness"):
+            d = decomposition.get(key)
+            if d:
+                print(f"  {key:<10} strongest={d['strongest']['accuracy']:.3f} "
+                      f"(majority {d['majority_baseline']:.3f}, "
+                      f"above by {d['above_majority']:+.3f})")
+        if pure_batch:
+            worst = max(pure_batch, key=lambda kv: kv[1]["above_majority"])
+            excess = worst[1]["above_majority"]
+            print(f"  PURE BATCH ({worst[0]}): {worst[1]['strongest']['accuracy']:.3f} "
+                  f"vs majority {worst[1]['majority_baseline']:.3f} "
+                  f"-> above by {excess:+.3f}")
+            if excess >= 0.20:
+                rec = ("BATCH IS REAL — same biology, different day is highly separable. "
+                       "Build the date-adversary.")
+            elif excess >= 0.08:
+                rec = ("MILD BATCH — some day-to-day signal. A date-adversary may help, "
+                       "but the leak is mostly biology.")
+            else:
+                rec = ("BATCH IS MINIMAL — the condition leak is mostly legitimate "
+                       "stiffness biology. Skip the date-adversary; proceed to clustering.")
+            print(f"  => {rec}")
+            report["decomposition"]["recommendation"] = rec
+        else:
+            print("  [no controlled contrast available: no stiffness repeats across dates]")
     if endmt_r2 is not None:
         best_r2 = max(endmt_r2.items(), key=lambda kv: kv[1])
         print(f"EndMT-retention R2 (strongest: {best_r2[0]}): {best_r2[1]:.3f}  "
