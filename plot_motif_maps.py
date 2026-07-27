@@ -71,31 +71,74 @@ def _composite(im):
     return rgb
 
 
-def find_tile(imgs_dir: Path, cond: str, img_id: str, diagnose: bool = True):
-    """Locate the raw tile, trying several layouts, and SAY why if it fails."""
-    searched = []
-    for folder in (imgs_dir / cond / "tiles", imgs_dir / cond, imgs_dir):
-        searched.append(folder)
-        if not folder.exists():
+def _norm(s: str) -> str:
+    """Loose key for matching names that differ only in case/punctuation."""
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
+_TILE_INDEX: dict[str, dict] = {}
+
+
+def build_tile_index(imgs_dir: Path, cond: str, verbose: bool = True) -> dict:
+    """Recursively index EVERY image file for a condition, at any depth.
+
+    Layout-agnostic on purpose: works whether tiles live in
+    <imgs>/<cond>/tiles/, <imgs>/<cond>/, or somewhere deeper. Cached per
+    condition so the (slow, over Drive) walk happens once.
+    """
+    if cond in _TILE_INDEX:
+        return _TILE_INDEX[cond]
+
+    roots = [imgs_dir / cond, imgs_dir]
+    exact: dict[str, Path] = {}
+    loose: dict[str, Path] = {}
+    scanned_root = None
+    for root in roots:
+        if not root.exists():
             continue
-        for ext in IMG_EXTS:                       # exact name first
-            p = folder / f"{img_id}{ext}"
-            if p.exists():
-                return p
-        hits = sorted(folder.glob(f"{img_id}.*")) or sorted(folder.glob(f"{img_id}*"))
-        if hits:
-            return hits[0]
+        scanned_root = root
+        try:
+            for p in root.rglob("*"):
+                if p.suffix.lower() in IMG_EXTS:
+                    exact.setdefault(p.stem, p)
+                    loose.setdefault(_norm(p.stem), p)
+        except Exception as e:
+            print(f"    [index error] {root}: {e}")
+        if exact:
+            break                                   # found tiles; stop widening
+
+    idx = {"exact": exact, "loose": loose, "root": scanned_root}
+    _TILE_INDEX[cond] = idx
+    if verbose:
+        if exact:
+            sample = list(exact)[:3]
+            print(f"    indexed {len(exact)} tile(s) under {scanned_root}  "
+                  f"e.g. {sample}")
+        else:
+            print(f"    [NO TILES INDEXED] nothing with extensions {IMG_EXTS} "
+                  f"found under {roots[0]} or {roots[1]}")
+    return idx
+
+
+def find_tile(imgs_dir: Path, cond: str, img_id: str, diagnose: bool = True):
+    """Look the tile up in the recursive index; report clearly on failure."""
+    idx = build_tile_index(imgs_dir, cond, verbose=diagnose)
+    p = idx["exact"].get(img_id) or idx["loose"].get(_norm(img_id))
+    if p is not None:
+        return p
+    # last resort: unique substring match (handles extra prefixes/suffixes)
+    hits = [v for k, v in idx["loose"].items() if _norm(img_id) in k]
+    if len(hits) == 1:
+        return hits[0]
     if diagnose:
-        print(f"    [tile NOT FOUND] image_id='{img_id}' condition='{cond}'")
-        for folder in searched:
-            if folder.exists():
-                try:
-                    names = [p.name for p in sorted(folder.iterdir())[:5]]
-                except Exception as e:
-                    names = [f"(unreadable: {e})"]
-                print(f"      searched {folder}  ->  exists, e.g. {names}")
-            else:
-                print(f"      searched {folder}  ->  DOES NOT EXIST")
+        print(f"    [tile NOT FOUND] image_id='{img_id}' in condition '{cond}'")
+        if idx["exact"]:
+            print(f"      {len(idx['exact'])} tiles are indexed; example stems: "
+                  f"{list(idx['exact'])[:5]}")
+            print("      -> the tile names do not match the image_id. Compare the "
+                  "stems above with the image_id and tell me the pattern.")
+        if len(hits) > 1:
+            print(f"      ambiguous substring match ({len(hits)} candidates)")
     return None
 
 
@@ -105,7 +148,9 @@ def load_tile(imgs_dir: Path, cond: str, img_id: str):
         return None
     try:
         import tifffile
-        return tifffile.imread(str(p))
+        img = tifffile.imread(str(p))
+        print(f"    tile OK: {p.name}  shape={img.shape}")
+        return img
     except Exception as e:
         print(f"    [tile READ FAILED] {p}: {e}")
         return None
@@ -170,6 +215,9 @@ def main() -> None:
     ap.add_argument("--overlay", action="store_true",
                     help="draw the motif map on top of the tile as well")
     ap.add_argument("--no-edges", action="store_true")
+    ap.add_argument("--debug-tiles", action="store_true",
+                    help="report which tiles can be found for the selected images, "
+                         "then exit without plotting")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -199,6 +247,18 @@ def main() -> None:
                               replace=False)
             picks += [(cond, i) for i in take]
     print(f"Drawing {len(picks)} image(s)\n")
+
+    # ---- tile-only diagnostic: answer "where are the tiles?" and stop ----
+    if args.debug_tiles:
+        print("=" * 70)
+        print("TILE DIAGNOSTIC")
+        print("=" * 70)
+        for cond, img_id in picks:
+            print(f"\n{cond} / {img_id}")
+            p = find_tile(args.imgs_dir, cond, img_id)
+            print(f"  -> {'FOUND: ' + str(p) if p else 'NOT FOUND'}")
+        print("\n" + "=" * 70)
+        return
 
     handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor=colors[m],
                       markeredgecolor="black", markersize=9, label=f"motif {m}")
@@ -241,9 +301,13 @@ def main() -> None:
             axL.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
                        fontsize=9, frameon=False)
         fig.tight_layout()
-        fig.savefig(out_dir / f"motif_map_{cond}__{img_id}.png", dpi=140,
-                    bbox_inches="tight")
+        fp = out_dir / f"motif_map_{cond}__{img_id}.png"
+        fig.savefig(fp, dpi=140, bbox_inches="tight")
         plt.close(fig)
+        from PIL import Image as _Im
+        w, h = _Im.open(fp).size
+        print(f"    wrote {fp.name}  {w}x{h}  "
+              f"({'TWO-PANEL' if raw is not None else 'single panel (no tile)'})")
 
         # ---- 3. per-motif breakdown, coloured by EndMT ----
         if e_idx is not None:
