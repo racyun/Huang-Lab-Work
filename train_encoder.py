@@ -56,6 +56,22 @@ INTENSITY_COLS = [
     "ch3_cellwise_mean_intensity",
 ]
 
+
+def adv_label_from_condition(condition: str, target: str) -> str:
+    """Derive the adversary's target label from a condition folder name.
+
+    '260516_500kPa' -> date '260516' | stiffness '500kPa' | condition (whole).
+
+    Scrubbing `date` targets the BATCH confound only, leaving stiffness (real
+    biology, and the cause of EndMT) untouched — unlike scrubbing `condition`,
+    which fuses the two and destroys legitimate signal.
+    """
+    if target == "date":
+        return str(condition).partition("_")[0]
+    if target == "stiffness":
+        return str(condition).partition("_")[2] or "unknown"
+    return str(condition)
+
 DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 
 
@@ -115,12 +131,26 @@ def extract_neighborhood(data: Data, center: int, hops: int = 2) -> Data:
 # Augmentations (methodology §8) — mild, identity-preserving; never drop center
 # --------------------------------------------------------------------------- #
 
-def augment(sub: Data, edge_drop=0.2, feat_mask=0.1, node_drop=0.1, feat_noise=0.05) -> Data:
+def augment(sub: Data, edge_drop=0.2, feat_mask=0.1, node_drop=0.1, feat_noise=0.05,
+            intensity_jitter=0.0, intensity_cols=None) -> Data:
     x = sub.x.clone()
     edge_index = sub.edge_index
     edge_attr = sub.edge_attr
     center = int(sub.center)
     n = x.shape[0]
+
+    # ----- intensity jitter: ONE shared scale+offset across all cells in this
+    # view, applied to the marker channels only. Mimics a real staining /
+    # illumination difference (coherent per image), unlike feat_noise which is
+    # independent per cell. Because the two views get different jitter, the
+    # contrastive loss teaches "absolute brightness does not define a
+    # neighborhood" — batch-invariance learned WITHOUT fighting biology.
+    # endmt_score is deliberately excluded: it is a within-cell ratio and is
+    # already batch-robust by construction.
+    if intensity_jitter > 0 and intensity_cols:
+        scale = 1.0 + intensity_jitter * (torch.rand(1).item() * 2.0 - 1.0)
+        offset = intensity_jitter * (torch.rand(1).item() * 2.0 - 1.0)
+        x[:, intensity_cols] = x[:, intensity_cols] * scale + offset
 
     # ----- feature masking: zero a random subset of feature DIMENSIONS -----
     if feat_mask > 0 and x.shape[1] > 0:
@@ -171,14 +201,15 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
     """
 
     def __init__(self, graph_paths, hops=2, samples_per_epoch=None, aug_kwargs=None,
-                 endmt_idx=None, batchnorm_cols=None):
+                 endmt_idx=None, batchnorm_cols=None, adv_target="condition"):
         self.hops = hops
         self.aug_kwargs = aug_kwargs or {}
         self.endmt_idx = endmt_idx                 # feature index of endmt_score (or None)
+        self.adv_target = adv_target
         self._graph_cache: dict[str, Data] = {}
         # build (path, center) index over all cells that have neighbors
         self.index: list[tuple[str, int]] = []
-        conds = set()
+        labels = set()
         for p in graph_paths:
             g = torch.load(p, weights_only=False)
             if g.edge_index.shape[1] == 0:
@@ -186,18 +217,22 @@ class ContrastiveNeighborhoods(torch.utils.data.Dataset):
             if batchnorm_cols:                     # per-image intensity batch-norm
                 batchnorm_intensities_(g.x, batchnorm_cols)
             self._graph_cache[p] = g
-            conds.add(g.condition)
+            labels.add(adv_label_from_condition(g.condition, adv_target))
             deg = torch.bincount(g.edge_index[0], minlength=g.num_nodes)
             for c in torch.nonzero(deg > 0).flatten().tolist():
                 self.index.append((p, c))
-        # stable condition -> integer label (for the adversary)
-        self.conditions = sorted(conds)
+        # stable adversary label -> integer (target set by --adv-target)
+        self.conditions = sorted(labels)
         self.cond_to_idx = {c: i for i, c in enumerate(self.conditions)}
-        self._path_cond = {p: self.cond_to_idx[g.condition]
-                           for p, g in self._graph_cache.items()}
+        self._path_cond = {
+            p: self.cond_to_idx[adv_label_from_condition(g.condition, adv_target)]
+            for p, g in self._graph_cache.items()
+        }
         self.samples_per_epoch = samples_per_epoch or len(self.index)
         print(f"  {len(self.index)} candidate neighborhoods over "
-              f"{len(self._graph_cache)} graphs, {len(self.conditions)} conditions")
+              f"{len(self._graph_cache)} graphs")
+        print(f"  adversary target '{adv_target}': {len(self.conditions)} classes "
+              f"{self.conditions}")
 
     def __len__(self):
         return self.samples_per_epoch
@@ -259,7 +294,12 @@ def main() -> None:
     ap.add_argument("--num-workers", type=int, default=4)
     # ----- adversarial confound scrubbing (methodology §6, §9) -----
     ap.add_argument("--adversarial", action="store_true",
-                    help="add a gradient-reversal condition adversary to scrub the confound")
+                    help="add a gradient-reversal adversary to scrub the confound")
+    ap.add_argument("--adv-target", choices=["condition", "date", "stiffness"],
+                    default="condition",
+                    help="what the adversary is trained to forget. 'date' scrubs the "
+                         "BATCH confound only, leaving stiffness biology intact "
+                         "(recommended); 'condition' fuses both (default, legacy)")
     ap.add_argument("--adv-lambda-max", type=float, default=1.0,
                     help="peak GRL strength lambda (ramped 0 -> this)")
     ap.add_argument("--adv-gamma", type=float, default=10.0,
@@ -277,7 +317,13 @@ def main() -> None:
                     help="weight of the EndMT regression loss")
     # ----- input-level batch correction (methodology §C) -----
     ap.add_argument("--batch-norm-features", action="store_true",
-                    help="per-image standardize intensity channels to remove batch offsets")
+                    help="per-image standardize intensity channels. NOT RECOMMENDED: "
+                         "measured WORSE batch leakage than without it (+0.365 vs "
+                         "+0.289 pure-batch excess). Kept for reproducibility.")
+    ap.add_argument("--intensity-jitter", type=float, default=0.0,
+                    help="augmentation: coherent per-view scale+offset on the marker "
+                         "channels (e.g. 0.3), teaching batch-invariance through the "
+                         "contrastive loss instead of fighting it adversarially")
     ap.add_argument("--push-to-drive", action="store_true")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="huang-lab-stage3")
@@ -299,22 +345,30 @@ def main() -> None:
     g0 = torch.load(graph_paths[0], weights_only=False)
     in_dim = g0.x.shape[1]
 
-    # resolve feature-column indices from feature_names.json (for endmt + batch-norm)
-    endmt_idx = None; batchnorm_cols = None
+    # resolve feature-column indices from feature_names.json
+    endmt_idx = None; batchnorm_cols = None; intensity_cols = None
     fn_path = args.graphs_dir / "feature_names.json"
     if fn_path.exists():
         feat_names = json.loads(fn_path.read_text())
         if "endmt_score" in feat_names:
             endmt_idx = feat_names.index("endmt_score")
+        idx = [feat_names.index(c) for c in INTENSITY_COLS if c in feat_names]
         if args.batch_norm_features:
-            batchnorm_cols = [feat_names.index(c) for c in INTENSITY_COLS if c in feat_names]
+            batchnorm_cols = idx
             print(f"  batch-norm ON — per-image standardizing columns {batchnorm_cols}")
+        if args.intensity_jitter > 0:
+            intensity_cols = idx
+            print(f"  intensity jitter ON (±{args.intensity_jitter}) on columns {idx}")
     if args.endmt_head and endmt_idx is None:
         raise SystemExit("--endmt-head needs endmt_score in feature_names.json")
 
+    aug_kwargs = {"intensity_jitter": args.intensity_jitter,
+                  "intensity_cols": intensity_cols}
     ds = ContrastiveNeighborhoods(graph_paths, hops=args.hops,
                                   samples_per_epoch=args.samples_per_epoch,
-                                  endmt_idx=endmt_idx, batchnorm_cols=batchnorm_cols)
+                                  aug_kwargs=aug_kwargs,
+                                  endmt_idx=endmt_idx, batchnorm_cols=batchnorm_cols,
+                                  adv_target=args.adv_target)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, collate_fn=paired_collate,
                         drop_last=True, persistent_workers=args.num_workers > 0)
@@ -339,9 +393,9 @@ def main() -> None:
         # default (adv_steps==1): adversary trained in the combined GRL step (as before).
         # adv_steps>1 adds extra adversary-only updates via a separate optimizer.
         enc_params += list(adversary.parameters())
-        print(f"  adversarial scrubbing ON — {len(ds.conditions)} conditions, "
-              f"lambda 0->{args.adv_lambda_max}, adv_layers={args.adv_layers}, "
-              f"adv_steps={args.adv_steps}")
+        print(f"  adversarial scrubbing ON — target='{args.adv_target}' "
+              f"({len(ds.conditions)} classes), lambda 0->{args.adv_lambda_max}, "
+              f"adv_layers={args.adv_layers}, adv_steps={args.adv_steps}")
     opt = torch.optim.AdamW(enc_params, lr=args.lr, weight_decay=args.weight_decay)
     adv_opt = (torch.optim.AdamW(adversary.parameters(), lr=args.lr)
                if (adversary is not None and args.adv_steps > 1) else None)
@@ -457,7 +511,9 @@ def main() -> None:
                     "config": {"in_dim": in_dim, "hidden_dim": args.hidden_dim,
                                "emb_dim": args.emb_dim, "heads": args.heads,
                                "edge_dim": 4, "dropout": args.dropout,
-                               "batch_norm_features": args.batch_norm_features},
+                               "batch_norm_features": args.batch_norm_features,
+                               "adv_target": args.adv_target if args.adversarial else None,
+                               "intensity_jitter": args.intensity_jitter},
                     "epoch": epoch, "loss": ep_loss},
                    stage3 / "encoder.pt")
 
