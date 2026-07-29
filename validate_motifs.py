@@ -19,9 +19,10 @@ clusters mean anything:
   4. SEPARATION  Silhouette score: are the clusters distinct, or arbitrary cuts
      through one continuous blob?
 
-Outputs:
+Outputs (all written to --out-dir, alongside the plot_motif_maps figures):
     <out>/validation_report.json
     <out>/motif_recurrence.csv
+    <out>/validation_log.txt      full console transcript of the run
 
 Usage:
     python validate_motifs.py --motifs <stage4>/motifs.parquet
@@ -33,11 +34,35 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+
+
+class _Tee:
+    """Mirror everything printed to the console into a log file as well."""
+
+    def __init__(self, path: Path):
+        self.file = open(path, "w")
+        self.stdout = sys.stdout
+
+    def write(self, s):
+        self.stdout.write(s)
+        self.file.write(s)
+
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self):
+        try:
+            self.file.close()
+        except Exception:
+            pass
 
 
 def _default_local_root() -> Path:
@@ -222,33 +247,54 @@ def main() -> None:
 
     out_dir = args.out_dir or args.motifs.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    mdf = pd.read_parquet(args.motifs)
-    n_motifs = int(mdf["motif"].max()) + 1
-    print(f"Validating {n_motifs} motifs over {len(mdf)} cells")
 
-    report = {"n_motifs": n_motifs, "n_cells": int(len(mdf))}
-    report["spatial_coherence"] = spatial_coherence(
-        mdf, args.graphs_dir, args.max_images, args.n_perm, args.seed, n_motifs)
-    report["recurrence"] = recurrence(mdf, out_dir, n_motifs)
-    if args.embeddings:
-        report.update(stability(args.embeddings, mdf, n_motifs,
-                                args.stability_cells, args.seed))
+    # Tee the whole run into a log file next to the other outputs, so the
+    # console transcript is saved alongside the figures/JSON. try/finally so
+    # the log survives even if a test raises.
+    log_path = out_dir / "validation_log.txt"
+    tee = _Tee(log_path)
+    sys.stdout = tee
+    try:
+        print(f"validate_motifs.py — {datetime.now():%Y-%m-%d %H:%M:%S}")
+        print(f"  motifs     : {args.motifs}")
+        print(f"  graphs-dir : {args.graphs_dir}")
+        print(f"  embeddings : {args.embeddings}")
+        print(f"  out-dir    : {out_dir}")
+        print(f"  max-images={args.max_images}  n-perm={args.n_perm}  "
+              f"stability-cells={args.stability_cells}  seed={args.seed}")
 
-    (out_dir / "validation_report.json").write_text(json.dumps(report, indent=2))
-    print(f"\nWrote {out_dir / 'validation_report.json'}")
+        mdf = pd.read_parquet(args.motifs)
+        n_motifs = int(mdf["motif"].max()) + 1
+        print(f"\nValidating {n_motifs} motifs over {len(mdf)} cells")
 
-    sc = report.get("spatial_coherence", {})
-    print("\n" + "=" * 66)
-    print("BOTTOM LINE")
-    if sc:
-        print(f"  spatial coherence : {sc['ratio']:.2f}x  ({sc['verdict']})")
-    print(f"  recurring motifs  : {report['recurrence']['n_widespread']}/{n_motifs}")
-    if "mean_ari" in report:
-        print(f"  stability (ARI)   : {report['mean_ari']:.3f}  "
-              f"({report['stability_verdict']})")
-        print(f"  separation        : silhouette {report['silhouette']:.3f}  "
-              f"({report['separation']})")
-    print("=" * 66)
+        report = {"n_motifs": n_motifs, "n_cells": int(len(mdf))}
+        report["spatial_coherence"] = spatial_coherence(
+            mdf, args.graphs_dir, args.max_images, args.n_perm, args.seed, n_motifs)
+        report["recurrence"] = recurrence(mdf, out_dir, n_motifs)
+        if args.embeddings:
+            report.update(stability(args.embeddings, mdf, n_motifs,
+                                    args.stability_cells, args.seed))
+
+        (out_dir / "validation_report.json").write_text(json.dumps(report, indent=2))
+        print(f"\nWrote {out_dir / 'validation_report.json'}")
+
+        sc = report.get("spatial_coherence", {})
+        print("\n" + "=" * 66)
+        print("BOTTOM LINE")
+        if sc:
+            print(f"  spatial coherence : {sc['ratio']:.2f}x  ({sc['verdict']})")
+        print(f"  recurring motifs  : {report['recurrence']['n_widespread']}/{n_motifs}")
+        if "mean_ari" in report:
+            print(f"  stability (ARI)   : {report['mean_ari']:.3f}  "
+                  f"({report['stability_verdict']})")
+            print(f"  separation        : silhouette {report['silhouette']:.3f}  "
+                  f"({report['separation']})")
+        print("=" * 66)
+        print(f"\nWrote {log_path}")
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"Validation log saved -> {log_path}")
 
 
 if __name__ == "__main__":
