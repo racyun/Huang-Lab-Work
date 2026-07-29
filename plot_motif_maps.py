@@ -157,23 +157,41 @@ def load_tile(imgs_dir: Path, cond: str, img_id: str):
 
 
 def draw_map(ax, g, motifs_for_image, colors, overlay_img=None, node_size=28,
-             show_edges=True):
+             show_edges=True, color_by="motif", endmt=None,
+             within_motif_edges_only=False):
+    """Draw an image's graph.
+
+    color_by='motif'  -> nodes take their motif colour
+    color_by='endmt'  -> nodes take the coolwarm EndMT colour map (0..1), the
+                         same mapping used by the neighbourhood-subgraph viewers
+    within_motif_edges_only -> keep only edges whose two endpoints share a motif
+    """
     pos = g.pos.numpy()
     if overlay_img is not None:
         ax.imshow(_composite(overlay_img))
     if show_edges:
         ei = g.edge_index.numpy()
+        if within_motif_edges_only:
+            keep = motifs_for_image[ei[0]] == motifs_for_image[ei[1]]
+            ei = ei[:, keep]
         edge_col = "white" if overlay_img is not None else "gray"
         alpha = 0.35 if overlay_img is not None else 0.4
         for s, d in ei.T:
             ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
                     lw=0.35, color=edge_col, alpha=alpha, zorder=1)
-    ax.scatter(pos[:, 0], pos[:, 1], c=[colors[m] for m in motifs_for_image],
-               s=node_size, zorder=2, edgecolors="black", linewidths=0.25)
+    if color_by == "endmt" and endmt is not None:
+        sc = ax.scatter(pos[:, 0], pos[:, 1], c=endmt, cmap="coolwarm",
+                        vmin=0, vmax=1, s=node_size, zorder=2,
+                        edgecolors="black", linewidths=0.25)
+    else:
+        sc = ax.scatter(pos[:, 0], pos[:, 1],
+                        c=[colors[m] for m in motifs_for_image],
+                        s=node_size, zorder=2, edgecolors="black", linewidths=0.25)
     if overlay_img is None:
         ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.axis("off")
+    return sc
 
 
 def draw_endmt_for_motif(ax, g, motifs_for_image, endmt, motif_id, node_size=26):
@@ -189,6 +207,115 @@ def draw_endmt_for_motif(ax, g, motifs_for_image, endmt, motif_id, node_size=26)
     ax.set_aspect("equal")
     ax.axis("off")
     return sc, int(sel.sum())
+
+
+def build_motif_catalog(mdf, graphs_dir: Path, n_motifs: int, colors,
+                        e_idx, out_dir: Path, max_images: int, seed: int):
+    """One catalog image per unique motif.
+
+    For each motif we scan images, take the LARGEST connected patch of that
+    motif (its cells plus only the edges between them) as the exemplar to draw,
+    and colour its nodes by EndMT score.
+
+    "Occurrences" is the total number of cells assigned to that motif across
+    every image in the dataset (exact — taken from motifs.parquet, not the
+    scanned sample). The number of distinct spatial patches found while
+    scanning is reported separately, since one contiguous patch contains many
+    cells.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    cat_dir = out_dir / "Motif catalog"
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nBuilding motif catalog -> {cat_dir}")
+
+    # exact occurrence counts over the WHOLE dataset
+    cell_counts = mdf["motif"].value_counts().to_dict()
+    imgs_present = (mdf.groupby("motif")["image_id"].nunique()).to_dict()
+    n_images_total = mdf[["condition", "image_id"]].drop_duplicates().shape[0]
+
+    # scan a sample of images for the best exemplar patch per motif
+    pairs = mdf[["condition", "image_id"]].drop_duplicates()
+    if len(pairs) > max_images:
+        pairs = pairs.sample(max_images, random_state=seed)
+    best = {m: None for m in range(n_motifs)}      # (size, cond, img, node_ids)
+    patches = {m: 0 for m in range(n_motifs)}
+    print(f"  scanning {len(pairs)} images for exemplar patches...")
+
+    for cond, img in pairs.itertuples(index=False):
+        gp = graphs_dir / cond / f"{img}.pt"
+        if not gp.exists():
+            continue
+        g = torch.load(str(gp), weights_only=False)
+        sub = mdf[(mdf.condition == cond) & (mdf.image_id == img)]
+        if len(sub) != g.num_nodes or g.edge_index.shape[1] == 0:
+            continue
+        lab = sub["motif"].to_numpy()
+        src, dst = g.edge_index.numpy()
+        same = lab[src] == lab[dst]                # within-motif edges only
+        for m in range(n_motifs):
+            idx = np.flatnonzero(lab == m)
+            if idx.size < 2:
+                continue
+            remap = -np.ones(g.num_nodes, dtype=int)
+            remap[idx] = np.arange(idx.size)
+            em = same & (lab[src] == m)
+            s2, d2 = remap[src[em]], remap[dst[em]]
+            if s2.size == 0:
+                continue
+            adj = coo_matrix((np.ones(s2.size), (s2, d2)),
+                             shape=(idx.size, idx.size))
+            ncomp, cl = connected_components(adj, directed=False)
+            sizes = np.bincount(cl)
+            patches[m] += int((sizes >= 2).sum())
+            k = int(sizes.argmax())
+            if best[m] is None or sizes[k] > best[m][0]:
+                best[m] = (int(sizes[k]), cond, img, idx[cl == k])
+
+    # draw one figure per motif
+    for m in range(n_motifs):
+        if best[m] is None:
+            print(f"  [skip] motif {m}: no connected patch found")
+            continue
+        size, cond, img, node_ids = best[m]
+        g = torch.load(str(graphs_dir / cond / f"{img}.pt"), weights_only=False)
+        pos = g.pos.numpy()[node_ids]
+        endmt = g.x[node_ids, e_idx].numpy() if e_idx is not None else None
+
+        keep = set(node_ids.tolist())
+        src, dst = g.edge_index.numpy()
+        remap = {n: i for i, n in enumerate(node_ids.tolist())}
+        edges = [(remap[s], remap[d]) for s, d in zip(src, dst)
+                 if s in keep and d in keep]
+
+        fig, ax = plt.subplots(figsize=(8, 8.8))
+        for s, d in edges:
+            ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
+                    lw=0.9, color="gray", alpha=0.6, zorder=1)
+        if endmt is not None:
+            sc = ax.scatter(pos[:, 0], pos[:, 1], c=endmt, cmap="coolwarm",
+                            vmin=0, vmax=1, s=90, zorder=2,
+                            edgecolors="black", linewidths=0.4)
+            cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+            cb.set_label("EndMT score (0 = endothelial, 1 = mesenchymal)")
+        else:
+            ax.scatter(pos[:, 0], pos[:, 1], color=colors[m], s=90, zorder=2,
+                       edgecolors="black", linewidths=0.4)
+        ax.set_aspect("equal"); ax.invert_yaxis(); ax.axis("off")
+        ax.set_title(f"Motif {m}", fontsize=17, color=colors[m], fontweight="bold")
+        occ = cell_counts.get(m, 0)
+        fig.text(0.5, 0.045, f"Occurrences: {occ:,}", ha="center", fontsize=15,
+                 fontweight="bold")
+        fig.text(0.5, 0.012,
+                 f"present in {imgs_present.get(m, 0):,} / {n_images_total:,} images"
+                 f"   |   {patches[m]:,} distinct patches in {len(pairs)} scanned"
+                 f"   |   exemplar: {cond}/{img} ({size} cells)",
+                 ha="center", fontsize=9, color="dimgrey")
+        fp = cat_dir / f"motif_{m:02d}.png"
+        fig.savefig(fp, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  wrote {fp.name}  (Occurrences: {occ:,}, exemplar {size} cells)")
 
 
 def endmt_index(graphs_dir: Path):
@@ -215,6 +342,11 @@ def main() -> None:
     ap.add_argument("--overlay", action="store_true",
                     help="draw the motif map on top of the tile as well")
     ap.add_argument("--no-edges", action="store_true")
+    ap.add_argument("--catalog", action="store_true",
+                    help="also build the 'Motif catalog' subfolder: one exemplar "
+                         "image per unique motif, nodes coloured by EndMT score")
+    ap.add_argument("--catalog-images", type=int, default=300,
+                    help="images scanned to find each motif's exemplar patch")
     ap.add_argument("--debug-tiles", action="store_true",
                     help="report which tiles can be found for the selected images, "
                          "then exit without plotting")
@@ -281,18 +413,38 @@ def main() -> None:
         if raw is not None:
             n_with_tile += 1
 
-        # ---- 1. per-image two-panel figure ----
+        # ---- 1. per-image FOUR-panel figure ----
+        #   1 clustering map | 2 original | 3 full overlay | 4 within-motif
+        #   overlay, nodes coloured by EndMT
+        endmt = g.x[:, e_idx].numpy() if e_idx is not None else None
         if raw is not None:
-            fig, (axL, axR) = plt.subplots(1, 2, figsize=(18, 9))
-            draw_map(axL, g, mfi, colors, raw if args.overlay else None,
-                     node_size=36, show_edges=not args.no_edges)
-            axL.set_title(f"Motif map — {g.num_nodes} cells", fontsize=11)
-            axR.imshow(_composite(raw))
-            axR.set_title("Original image (R=TAGLN, G=VE-cad, B=DAPI)", fontsize=11)
-            axR.axis("off")
-            axL.legend(handles=handles, loc="upper left", bbox_to_anchor=(0, -0.02),
-                       ncol=min(n_motifs, 6), fontsize=9, frameon=False)
-            fig.suptitle(f"{cond} / {img_id}", fontsize=13)
+            fig, axes4 = plt.subplots(1, 4, figsize=(34, 8.5))
+            draw_map(axes4[0], g, mfi, colors, None, node_size=30,
+                     show_edges=not args.no_edges)
+            axes4[0].set_title(f"1. Clustering map — {g.num_nodes} cells", fontsize=12)
+
+            axes4[1].imshow(_composite(raw))
+            axes4[1].set_title("2. Original image\n(R=TAGLN, G=VE-cad, B=DAPI)",
+                               fontsize=12)
+            axes4[1].axis("off")
+
+            draw_map(axes4[2], g, mfi, colors, raw, node_size=30,
+                     show_edges=not args.no_edges)
+            axes4[2].set_title("3. Full overlay\n(all edges)", fontsize=12)
+
+            sc4 = draw_map(axes4[3], g, mfi, colors, raw, node_size=30,
+                           show_edges=not args.no_edges, color_by="endmt",
+                           endmt=endmt, within_motif_edges_only=True)
+            axes4[3].set_title("4. Within-motif overlay\n(same-motif edges only, "
+                               "nodes = EndMT)", fontsize=12)
+            if endmt is not None:
+                cb = fig.colorbar(sc4, ax=axes4[3], fraction=0.046, pad=0.02)
+                cb.set_label("EndMT score", fontsize=9)
+
+            axes4[0].legend(handles=handles, loc="upper left",
+                            bbox_to_anchor=(0, -0.02), ncol=min(n_motifs, 6),
+                            fontsize=9, frameon=False)
+            fig.suptitle(f"{cond} / {img_id}", fontsize=14)
         else:
             fig, axL = plt.subplots(figsize=(9, 9))
             draw_map(axL, g, mfi, colors, None, node_size=36,
@@ -307,7 +459,7 @@ def main() -> None:
         from PIL import Image as _Im
         w, h = _Im.open(fp).size
         print(f"    wrote {fp.name}  {w}x{h}  "
-              f"({'TWO-PANEL' if raw is not None else 'single panel (no tile)'})")
+              f"({'FOUR-PANEL' if raw is not None else 'single panel (no tile)'})")
 
         # ---- 3. per-motif breakdown, coloured by EndMT ----
         if e_idx is not None:
@@ -374,6 +526,11 @@ def main() -> None:
         fig.savefig(fname, dpi=140, bbox_inches="tight")
         plt.close(fig)
         print(f"Wrote {fname.name}  ({ncol} conditions)")
+
+    # ---- 4. motif catalog ----
+    if args.catalog:
+        build_motif_catalog(mdf, args.graphs_dir, n_motifs, colors, e_idx,
+                            out_dir, args.catalog_images, args.seed)
 
 
 if __name__ == "__main__":
