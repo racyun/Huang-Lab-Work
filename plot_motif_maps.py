@@ -229,6 +229,7 @@ def build_motif_catalog(mdf, graphs_dir: Path, n_motifs: int, colors,
     cat_dir = out_dir / "Motif catalog"
     cat_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nBuilding motif catalog -> {cat_dir}")
+    print(f"  will write {n_motifs} catalog image(s) — one per unique motif")
 
     # exact occurrence counts over the WHOLE dataset
     cell_counts = mdf["motif"].value_counts().to_dict()
@@ -241,7 +242,8 @@ def build_motif_catalog(mdf, graphs_dir: Path, n_motifs: int, colors,
         pairs = pairs.sample(max_images, random_state=seed)
     best = {m: None for m in range(n_motifs)}      # (size, cond, img, node_ids)
     patches = {m: 0 for m in range(n_motifs)}
-    print(f"  scanning {len(pairs)} images for exemplar patches...")
+    print(f"  scanning {len(pairs)} of {n_images_total} source images to pick "
+          f"each motif's exemplar patch...")
 
     for cond, img in pairs.itertuples(index=False):
         gp = graphs_dir / cond / f"{img}.pt"
@@ -345,8 +347,11 @@ def main() -> None:
     ap.add_argument("--catalog", action="store_true",
                     help="also build the 'Motif catalog' subfolder: one exemplar "
                          "image per unique motif, nodes coloured by EndMT score")
-    ap.add_argument("--catalog-images", type=int, default=300,
-                    help="images scanned to find each motif's exemplar patch")
+    ap.add_argument("--catalog-scan-images", type=int, default=300,
+                    help="how many SOURCE images to scan when searching for each "
+                         "motif's exemplar patch. This does NOT set the number of "
+                         "catalog images — that is always one per motif. Scanning "
+                         "more is slower but may find a larger exemplar patch.")
     ap.add_argument("--debug-tiles", action="store_true",
                     help="report which tiles can be found for the selected images, "
                          "then exit without plotting")
@@ -530,7 +535,7 @@ def main() -> None:
     # ---- 4. motif catalog ----
     if args.catalog:
         build_motif_catalog(mdf, args.graphs_dir, n_motifs, colors, e_idx,
-                            out_dir, args.catalog_images, args.seed)
+                            out_dir, args.catalog_scan_images, args.seed)
 
 
 if __name__ == "__main__":
