@@ -292,6 +292,9 @@ def main() -> None:
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="random seed for torch/numpy/python. Change it to train an "
+                         "independent encoder for the reproducibility test.")
     # ----- adversarial confound scrubbing (methodology §6, §9) -----
     ap.add_argument("--adversarial", action="store_true",
                     help="add a gradient-reversal adversary to scrub the confound")
@@ -331,7 +334,10 @@ def main() -> None:
     ap.add_argument("--wandb-run-name", default=None)
     args = ap.parse_args()
 
-    torch.manual_seed(0); random.seed(0); np.random.seed(0)
+    torch.manual_seed(args.seed); random.seed(args.seed); np.random.seed(args.seed)
+    if args.seed != 0:
+        print(f"  seed={args.seed} (non-default: use this to train an independent "
+              f"encoder for the reproducibility test)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cpu":
