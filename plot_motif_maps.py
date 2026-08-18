@@ -36,7 +36,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-VERSION = "2026-07-27 two-panel + paired-grid + per-motif-EndMT"
+VERSION = "2026-07-28 four-panel + catalog + ego-subgraph galleries"
 IMG_EXTS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
 
@@ -320,21 +320,50 @@ def build_motif_catalog(mdf, graphs_dir: Path, n_motifs: int, colors,
         print(f"  wrote {fp.name}  (Occurrences: {occ:,}, exemplar {size} cells)")
 
 
-def build_motif_galleries(mdf, graphs_dir: Path, n_motifs: int, e_idx,
-                          out_dir: Path, scan_images: int, per_motif_limit: int,
-                          min_patch: int, seed: int):
-    """One folder per motif, holding many instances of that motif.
+def _pick_discriminating_features(out_dir: Path, feat_names: list[str], k: int):
+    """Rank node features by how much their per-motif means differ.
 
-    Each image shows one connected patch of the motif in its local context:
-    every cell/edge in the surrounding window is drawn grey, while the patch's
-    own cells and the edges between them are coloured by EndMT score (edges use
-    the mean EndMT of their two endpoints) — the same coolwarm 0..1 mapping as
-    the motif catalog and the neighbourhood-subgraph viewers.
+    A feature whose mean is nearly identical across motifs (endmt_score, in the
+    v4 run) carries no information about WHY a cell got its label, so colouring
+    by it makes every motif look arbitrary. Ranking by across-motif spread picks
+    the features that actually separate the clusters.
+    Returns [(feature_name, column_index, across_motif_std), ...].
     """
-    from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
+    summ = out_dir / "motif_summary.csv"
+    if not summ.exists():
+        idx = [feat_names.index(c) for c in feat_names if c != "on_border"][:k]
+        return [(feat_names[i], i, float("nan")) for i in idx]
+    df = pd.read_csv(summ)
+    scored = []
+    for i, name in enumerate(feat_names):
+        if name == "on_border" or name not in df.columns:
+            continue
+        scored.append((name, i, float(df[name].std())))
+    scored.sort(key=lambda t: -t[2])
+    return scored[:k]
 
-    cmap = plt.cm.coolwarm
+
+def build_motif_galleries(mdf, graphs_dir: Path, n_motifs: int, feat_names,
+                          out_dir: Path, scan_images: int, per_motif_limit: int,
+                          hops: int, n_panels: int, seed: int):
+    """One folder per motif, holding NEIGHBOURHOOD SUBGRAPHS of that motif.
+
+    (A) Each image is one cell's k-hop ego-subgraph — the exact unit the encoder
+        embedded and the clusterer grouped — not an arbitrary connected patch.
+        The centre cell (the one carrying the motif label) is starred.
+    (B) The subgraph is drawn once per DISCRIMINATING feature, chosen
+        automatically as those whose per-motif means differ most.
+    (C) A caption compares this neighbourhood's feature means against the
+        motif average and flags it representative or atypical, so a
+        boundary case is distinguishable from an incoherent cluster.
+    """
+    from torch_geometric.utils import k_hop_subgraph
+
+    panels = _pick_discriminating_features(out_dir, feat_names, n_panels)
+    summ_path = out_dir / "motif_summary.csv"
+    profiles = pd.read_csv(summ_path).set_index("motif") if summ_path.exists() else None
+    spread = {n: s for n, _, s in panels}
+
     dirs = {}
     for m in range(n_motifs):
         d = out_dir / f"Motif {m:02d}"
@@ -345,9 +374,13 @@ def build_motif_galleries(mdf, graphs_dir: Path, n_motifs: int, e_idx,
     if len(pairs) > scan_images:
         pairs = pairs.sample(scan_images, random_state=seed)
     print(f"\nBuilding per-motif galleries -> {out_dir}")
-    print(f"  {n_motifs} folders, up to {per_motif_limit} instances each")
-    print(f"  scanning {len(pairs)} source images (patches of >= {min_patch} cells)")
+    print(f"  {n_motifs} folders, up to {per_motif_limit} neighbourhoods each "
+          f"({hops}-hop ego-subgraphs)")
+    print("  panels use the most discriminating features:")
+    for n, _, s in panels:
+        print(f"    {n:<40} across-motif std={s:.3f}")
 
+    rng = np.random.default_rng(seed)
     saved = {m: 0 for m in range(n_motifs)}
     for cond, img in pairs.itertuples(index=False):
         if all(saved[m] >= per_motif_limit for m in range(n_motifs)):
@@ -360,72 +393,92 @@ def build_motif_galleries(mdf, graphs_dir: Path, n_motifs: int, e_idx,
         if len(sub) != g.num_nodes or g.edge_index.shape[1] == 0:
             continue
         lab = sub["motif"].to_numpy()
-        pos = g.pos.numpy()
-        endmt = g.x[:, e_idx].numpy() if e_idx is not None else np.zeros(g.num_nodes)
-        src, dst = g.edge_index.numpy()
+        deg = torch.bincount(g.edge_index[0], minlength=g.num_nodes).numpy()
 
         for m in range(n_motifs):
             if saved[m] >= per_motif_limit:
                 continue
-            idx = np.flatnonzero(lab == m)
-            if idx.size < min_patch:
+            cand = np.flatnonzero((lab == m) & (deg > 0))
+            if cand.size == 0:
                 continue
-            remap = -np.ones(g.num_nodes, dtype=int)
-            remap[idx] = np.arange(idx.size)
-            em = (lab[src] == m) & (lab[dst] == m)
-            s2, d2 = remap[src[em]], remap[dst[em]]
-            if s2.size == 0:
-                continue
-            adj = coo_matrix((np.ones(s2.size), (s2, d2)), shape=(idx.size, idx.size))
-            _, cl = connected_components(adj, directed=False)
-            for c in range(cl.max() + 1):
+            rng.shuffle(cand)
+            for centre in cand[:3]:               # a few per image, then move on
                 if saved[m] >= per_motif_limit:
                     break
-                nodes = idx[cl == c]
-                if nodes.size < min_patch:
+                subset, ei, mapping, _ = k_hop_subgraph(
+                    int(centre), hops, g.edge_index, relabel_nodes=True,
+                    num_nodes=g.num_nodes)
+                nodes = subset.numpy()
+                if nodes.size < 4:
                     continue
-                # zoom window around this patch
-                pad = 60
-                x0, y0 = pos[nodes].min(0) - pad
-                x1, y1 = pos[nodes].max(0) + pad
-                inwin = ((pos[:, 0] >= x0) & (pos[:, 0] <= x1) &
-                         (pos[:, 1] >= y0) & (pos[:, 1] <= y1))
+                pos = g.pos.numpy()[nodes]
+                ctr = int(mapping)
+                X = g.x.numpy()[nodes]
 
-                fig, ax = plt.subplots(figsize=(7, 7.6))
-                # grey context: everything in the window
-                wm = inwin[src] & inwin[dst]
-                for s, d in zip(src[wm], dst[wm]):
-                    ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
-                            lw=0.5, color="lightgrey", alpha=0.8, zorder=1)
-                ax.scatter(pos[inwin, 0], pos[inwin, 1], s=26, color="lightgrey",
-                           edgecolors="grey", linewidths=0.2, zorder=2)
-                # the motif patch: edges coloured by mean EndMT of endpoints
-                nodeset = set(nodes.tolist())
-                pm = np.array([s in nodeset and d in nodeset
-                               for s, d in zip(src, dst)])
-                for s, d in zip(src[pm], dst[pm]):
-                    ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
-                            lw=1.8, color=cmap(float(np.clip(
-                                (endmt[s] + endmt[d]) / 2.0, 0, 1))),
-                            alpha=0.95, zorder=3)
-                sc = ax.scatter(pos[nodes, 0], pos[nodes, 1], c=endmt[nodes],
-                                cmap="coolwarm", vmin=0, vmax=1, s=95, zorder=4,
-                                edgecolors="black", linewidths=0.5)
-                cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
-                cb.set_label("EndMT score (0 = endothelial, 1 = mesenchymal)")
-                ax.set_xlim(x0, x1); ax.set_ylim(y1, y0)
-                ax.set_aspect("equal"); ax.axis("off")
-                ax.set_title(f"Motif {m} — instance {saved[m] + 1}\n"
-                             f"{cond} / {img}   ({nodes.size} cells)", fontsize=11)
+                fig, axes = plt.subplots(1, len(panels),
+                                         figsize=(6 * len(panels), 6.9))
+                if len(panels) == 1:
+                    axes = [axes]
+                for ax, (fname, fidx, _) in zip(axes, panels):
+                    vals = X[:, fidx]
+                    is_endmt = fname == "endmt_score"
+                    vmin, vmax = (0, 1) if is_endmt else (-2, 2)
+                    for s, d in ei.numpy().T:
+                        ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
+                                lw=0.8, color="lightgrey", alpha=0.9, zorder=1)
+                    sc = ax.scatter(pos[:, 0], pos[:, 1], c=vals, cmap="coolwarm",
+                                    vmin=vmin, vmax=vmax, s=90, zorder=2,
+                                    edgecolors="black", linewidths=0.4)
+                    ax.scatter(pos[ctr, 0], pos[ctr, 1], s=340, marker="*",
+                               facecolors="none", edgecolors="black",
+                               linewidths=1.6, zorder=3)
+                    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+                    ax.set_title(fname.replace("_cellwise_mean", "")
+                                 .replace("_intensity", ""), fontsize=11)
+                    ax.set_aspect("equal"); ax.invert_yaxis(); ax.axis("off")
+
+                # ---- (C) typicality caption ----
+                inst = {n: float(X[:, i].mean()) for n, i, _ in panels}
+                cap_i = "  |  ".join(f"{n.split('_')[0]} {v:+.2f}"
+                                     for n, v in inst.items())
+                verdict, cap_m = "", ""
+                if profiles is not None and m in profiles.index:
+                    devs = []
+                    parts = []
+                    for n, _, _ in panels:
+                        if n in profiles.columns:
+                            mu = float(profiles.loc[m, n])
+                            parts.append(f"{n.split('_')[0]} {mu:+.2f}")
+                            s = spread.get(n) or 1.0
+                            devs.append(abs(inst[n] - mu) / (s if s > 1e-9 else 1.0))
+                    cap_m = "  |  ".join(parts)
+                    if devs:
+                        dev = float(np.mean(devs))
+                        verdict = ("representative" if dev < 1.0 else
+                                   "ATYPICAL — near a cluster boundary")
+                        verdict += f"  (mean deviation {dev:.2f} x across-motif spread)"
+                fig.suptitle(f"Motif {m} — neighbourhood {saved[m] + 1}   "
+                             f"({nodes.size} cells, {hops}-hop)\n"
+                             f"{cond} / {img}", fontsize=12)
+                fig.text(0.5, 0.055, f"this neighbourhood:  {cap_i}", ha="center",
+                         fontsize=10)
+                if cap_m:
+                    fig.text(0.5, 0.028, f"motif {m} average:    {cap_m}",
+                             ha="center", fontsize=10, color="dimgrey")
+                if verdict:
+                    fig.text(0.5, 0.002, verdict, ha="center", fontsize=10,
+                             fontweight="bold",
+                             color=("green" if verdict.startswith("repre") else "firebrick"))
                 fp = dirs[m] / f"motif{m:02d}_{saved[m] + 1:04d}_{cond}__{img}.png"
-                fig.savefig(fp, dpi=120, bbox_inches="tight")
+                fig.savefig(fp, dpi=115, bbox_inches="tight")
                 plt.close(fig)
                 saved[m] += 1
 
-    print("  instances saved per motif:")
+    print("  neighbourhoods saved per motif:")
     for m in range(n_motifs):
         print(f"    Motif {m:02d}: {saved[m]}  -> {dirs[m].name}/")
     return saved
+
 
 
 def endmt_index(graphs_dir: Path):
@@ -470,8 +523,12 @@ def main() -> None:
                          "thousands of images.")
     ap.add_argument("--gallery-scan-images", type=int, default=300,
                     help="source images scanned when collecting motif instances")
-    ap.add_argument("--min-patch", type=int, default=4,
-                    help="ignore motif patches smaller than this many cells")
+    ap.add_argument("--hops", type=int, default=2,
+                    help="ego-subgraph radius for gallery images; 2 matches the "
+                         "neighbourhood the encoder was trained on")
+    ap.add_argument("--n-panels", type=int, default=3,
+                    help="how many discriminating features to draw per gallery "
+                         "image (chosen automatically by across-motif spread)")
     ap.add_argument("--debug-tiles", action="store_true",
                     help="report which tiles can be found for the selected images, "
                          "then exit without plotting")
@@ -659,9 +716,15 @@ def main() -> None:
 
     # ---- 5. per-motif galleries ----
     if args.galleries:
-        build_motif_galleries(mdf, args.graphs_dir, n_motifs, e_idx, out_dir,
-                              args.gallery_scan_images, args.per_motif_limit,
-                              args.min_patch, args.seed)
+        fn = args.graphs_dir / "feature_names.json"
+        feat_names = json.loads(fn.read_text()) if fn.exists() else []
+        if not feat_names:
+            print("  [skip] galleries need feature_names.json")
+        else:
+            build_motif_galleries(mdf, args.graphs_dir, n_motifs, feat_names,
+                                  out_dir, args.gallery_scan_images,
+                                  args.per_motif_limit, args.hops,
+                                  args.n_panels, args.seed)
 
 
 if __name__ == "__main__":
