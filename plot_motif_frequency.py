@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,29 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
+
+
+def push_to_drive(out_dir: Path, root: Path) -> None:
+    """rclone the output directory up, mirroring its path under the local root.
+
+    ~/cellpose_work/v4/stage4_quick  ->  gdrive:<DRIVE_ROOT>/v4/stage4_quick
+    so the Drive layout matches the Studio layout without hardcoding either.
+    """
+    try:
+        rel = out_dir.resolve().relative_to(root.resolve())
+    except ValueError:
+        rel = Path(out_dir.name)
+    dest = f"gdrive:{DRIVE_ROOT}/{rel.as_posix()}"
+    print(f"\nPushing to Drive -> {dest}")
+    r = subprocess.run(["rclone", "copy", str(out_dir), dest,
+                        "--transfers=8", "--checkers=16", "--progress"])
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"rclone failed (exit {r.returncode}). Is rclone installed and is "
+            f"RCLONE_CONFIG exported in this shell?")
+    print("Push complete.")
 
 
 def _default_local_root() -> Path:
@@ -101,6 +125,8 @@ def main() -> None:
                     help="pool conditions with the same stiffness imaged on "
                          "different dates (cleaner scientifically; hides batch)")
     ap.add_argument("--title", default="Motif frequency across substrate stiffness")
+    ap.add_argument("--push-to-drive", action="store_true",
+                    help="rclone the output directory up to gdrive: when done")
     args = ap.parse_args()
 
     out_dir = args.out_dir or args.motifs.parent
@@ -197,6 +223,9 @@ def main() -> None:
     plt.close(fig)
     print(f"Wrote {out_dir / 'motif_frequency_grouped.png'}")
     print(f"Wrote {out_dir / 'motif_frequency.csv'}")
+
+    if args.push_to_drive:
+        push_to_drive(out_dir, root)
 
 
 if __name__ == "__main__":
