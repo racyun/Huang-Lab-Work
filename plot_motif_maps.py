@@ -320,6 +320,114 @@ def build_motif_catalog(mdf, graphs_dir: Path, n_motifs: int, colors,
         print(f"  wrote {fp.name}  (Occurrences: {occ:,}, exemplar {size} cells)")
 
 
+def build_motif_galleries(mdf, graphs_dir: Path, n_motifs: int, e_idx,
+                          out_dir: Path, scan_images: int, per_motif_limit: int,
+                          min_patch: int, seed: int):
+    """One folder per motif, holding many instances of that motif.
+
+    Each image shows one connected patch of the motif in its local context:
+    every cell/edge in the surrounding window is drawn grey, while the patch's
+    own cells and the edges between them are coloured by EndMT score (edges use
+    the mean EndMT of their two endpoints) — the same coolwarm 0..1 mapping as
+    the motif catalog and the neighbourhood-subgraph viewers.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    cmap = plt.cm.coolwarm
+    dirs = {}
+    for m in range(n_motifs):
+        d = out_dir / f"Motif {m:02d}"
+        d.mkdir(parents=True, exist_ok=True)
+        dirs[m] = d
+
+    pairs = mdf[["condition", "image_id"]].drop_duplicates()
+    if len(pairs) > scan_images:
+        pairs = pairs.sample(scan_images, random_state=seed)
+    print(f"\nBuilding per-motif galleries -> {out_dir}")
+    print(f"  {n_motifs} folders, up to {per_motif_limit} instances each")
+    print(f"  scanning {len(pairs)} source images (patches of >= {min_patch} cells)")
+
+    saved = {m: 0 for m in range(n_motifs)}
+    for cond, img in pairs.itertuples(index=False):
+        if all(saved[m] >= per_motif_limit for m in range(n_motifs)):
+            break
+        gp = graphs_dir / cond / f"{img}.pt"
+        if not gp.exists():
+            continue
+        g = torch.load(str(gp), weights_only=False)
+        sub = mdf[(mdf.condition == cond) & (mdf.image_id == img)]
+        if len(sub) != g.num_nodes or g.edge_index.shape[1] == 0:
+            continue
+        lab = sub["motif"].to_numpy()
+        pos = g.pos.numpy()
+        endmt = g.x[:, e_idx].numpy() if e_idx is not None else np.zeros(g.num_nodes)
+        src, dst = g.edge_index.numpy()
+
+        for m in range(n_motifs):
+            if saved[m] >= per_motif_limit:
+                continue
+            idx = np.flatnonzero(lab == m)
+            if idx.size < min_patch:
+                continue
+            remap = -np.ones(g.num_nodes, dtype=int)
+            remap[idx] = np.arange(idx.size)
+            em = (lab[src] == m) & (lab[dst] == m)
+            s2, d2 = remap[src[em]], remap[dst[em]]
+            if s2.size == 0:
+                continue
+            adj = coo_matrix((np.ones(s2.size), (s2, d2)), shape=(idx.size, idx.size))
+            _, cl = connected_components(adj, directed=False)
+            for c in range(cl.max() + 1):
+                if saved[m] >= per_motif_limit:
+                    break
+                nodes = idx[cl == c]
+                if nodes.size < min_patch:
+                    continue
+                # zoom window around this patch
+                pad = 60
+                x0, y0 = pos[nodes].min(0) - pad
+                x1, y1 = pos[nodes].max(0) + pad
+                inwin = ((pos[:, 0] >= x0) & (pos[:, 0] <= x1) &
+                         (pos[:, 1] >= y0) & (pos[:, 1] <= y1))
+
+                fig, ax = plt.subplots(figsize=(7, 7.6))
+                # grey context: everything in the window
+                wm = inwin[src] & inwin[dst]
+                for s, d in zip(src[wm], dst[wm]):
+                    ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
+                            lw=0.5, color="lightgrey", alpha=0.8, zorder=1)
+                ax.scatter(pos[inwin, 0], pos[inwin, 1], s=26, color="lightgrey",
+                           edgecolors="grey", linewidths=0.2, zorder=2)
+                # the motif patch: edges coloured by mean EndMT of endpoints
+                nodeset = set(nodes.tolist())
+                pm = np.array([s in nodeset and d in nodeset
+                               for s, d in zip(src, dst)])
+                for s, d in zip(src[pm], dst[pm]):
+                    ax.plot([pos[s, 0], pos[d, 0]], [pos[s, 1], pos[d, 1]],
+                            lw=1.8, color=cmap(float(np.clip(
+                                (endmt[s] + endmt[d]) / 2.0, 0, 1))),
+                            alpha=0.95, zorder=3)
+                sc = ax.scatter(pos[nodes, 0], pos[nodes, 1], c=endmt[nodes],
+                                cmap="coolwarm", vmin=0, vmax=1, s=95, zorder=4,
+                                edgecolors="black", linewidths=0.5)
+                cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+                cb.set_label("EndMT score (0 = endothelial, 1 = mesenchymal)")
+                ax.set_xlim(x0, x1); ax.set_ylim(y1, y0)
+                ax.set_aspect("equal"); ax.axis("off")
+                ax.set_title(f"Motif {m} — instance {saved[m] + 1}\n"
+                             f"{cond} / {img}   ({nodes.size} cells)", fontsize=11)
+                fp = dirs[m] / f"motif{m:02d}_{saved[m] + 1:04d}_{cond}__{img}.png"
+                fig.savefig(fp, dpi=120, bbox_inches="tight")
+                plt.close(fig)
+                saved[m] += 1
+
+    print("  instances saved per motif:")
+    for m in range(n_motifs):
+        print(f"    Motif {m:02d}: {saved[m]}  -> {dirs[m].name}/")
+    return saved
+
+
 def endmt_index(graphs_dir: Path):
     fn = graphs_dir / "feature_names.json"
     if fn.exists():
@@ -352,6 +460,18 @@ def main() -> None:
                          "motif's exemplar patch. This does NOT set the number of "
                          "catalog images — that is always one per motif. Scanning "
                          "more is slower but may find a larger exemplar patch.")
+    ap.add_argument("--galleries", action="store_true",
+                    help="build one folder per motif ('Motif 00', 'Motif 01', ...) "
+                         "holding many instances of that motif, context in grey and "
+                         "the motif's own cells/edges coloured by EndMT score")
+    ap.add_argument("--per-motif-limit", type=int, default=100,
+                    help="max instance images saved per motif folder (default 100). "
+                         "Raise for a fuller gallery; every patch would be tens of "
+                         "thousands of images.")
+    ap.add_argument("--gallery-scan-images", type=int, default=300,
+                    help="source images scanned when collecting motif instances")
+    ap.add_argument("--min-patch", type=int, default=4,
+                    help="ignore motif patches smaller than this many cells")
     ap.add_argument("--debug-tiles", action="store_true",
                     help="report which tiles can be found for the selected images, "
                          "then exit without plotting")
@@ -536,6 +656,12 @@ def main() -> None:
     if args.catalog:
         build_motif_catalog(mdf, args.graphs_dir, n_motifs, colors, e_idx,
                             out_dir, args.catalog_scan_images, args.seed)
+
+    # ---- 5. per-motif galleries ----
+    if args.galleries:
+        build_motif_galleries(mdf, args.graphs_dir, n_motifs, e_idx, out_dir,
+                              args.gallery_scan_images, args.per_motif_limit,
+                              args.min_patch, args.seed)
 
 
 if __name__ == "__main__":
