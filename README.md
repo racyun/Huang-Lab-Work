@@ -68,6 +68,14 @@ that a biologist could name, look like:
 pipeline actually discovers are named *after* clustering by looking at examples
 — see [Results so far](#10-results-so-far).)
 
+<p align="center">
+  <img src="docs/figures/motif_catalog_and_tissue_map.png" alt="Illustrative six-motif catalogue (endothelial sheet, transition focus, mesenchymal cluster, mixed interface, isolated transition, transition front) and a tissue map with each cell coloured by its assigned motif" width="720">
+  <br>
+  <em>Illustrative catalogue and tissue map from the project plan (schematic, not real data).
+  Top: the six hypothesised neighbourhood motifs. Bottom: what a motif map looks like —
+  each dot is one segmented cell at its real position, coloured by the motif its neighbourhood was assigned to.</em>
+</p>
+
 **What a result looks like.** Two headline outputs:
 
 - **Motif maps** — the original tile with every cell coloured by the motif its
@@ -75,11 +83,21 @@ pipeline actually discovers are named *after* clustering by looking at examples
   position; the colour = the motif label for that cell's *surroundings*.
   Neighbouring cells usually share a motif because they share most of the same
   neighbourhood, so the maps show contiguous coloured domains rather than
-  salt-and-pepper noise.
+  salt-and-pepper noise — a cell in the middle of an endothelial sheet and its
+  neighbour two cells over both "see" mostly the same surrounding cells, so
+  both get labelled *endothelial sheet*.
 - **Motif frequency across stiffness** — stacked bars of the proportion of each
   condition's cells in each motif. This is the scientific claim: if, say,
   mesenchymal-cluster motifs grow and endothelial-sheet motifs shrink as the
   substrate stiffens, that is a spatial signature of stiffness-driven EndMT.
+
+<p align="center">
+  <img src="docs/figures/motif_frequency_by_stiffness.png" alt="Illustrative stacked bar chart of motif proportion per stiffness condition, showing endothelial-sheet motifs shrinking and mesenchymal-cluster motifs growing as stiffness increases" width="720">
+  <br>
+  <em>Illustrative target figure from the project plan (mock data with placeholder stiffness values).
+  The real figure is produced by <code>plot_motif_frequency.py</code> over the actual
+  5 / 150 / 500 / 900 kPa conditions.</em>
+</p>
 
 ## 2. How the pipeline is used
 
@@ -383,7 +401,8 @@ Huang-Lab-Work/
 └── docs/
     ├── stage2_graph_construction.md      graph design, node/edge contract, QC suite
     ├── stage3_gnn_encoder.md             encoder + contrastive training plan
-    └── stage3_encoder_methodology.md     design rationale and alternatives considered
+    ├── stage3_encoder_methodology.md     design rationale and alternatives considered
+    └── figures/                          illustrative figures used in this README
 ```
 
 ## 13. Setup
