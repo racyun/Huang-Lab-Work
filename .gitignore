@@ -25,7 +25,6 @@ Thumbs.db
 .claude/
 
 # Project
-config/local.yaml
 outputs/
 *.pt
 *.pth

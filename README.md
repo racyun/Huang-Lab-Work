@@ -1,48 +1,42 @@
-# Huang Lab — AI for Cardiovascular Tissue-on-a-Chip Microscopy
+# EndMT Spatial-Motif Discovery — Huang Lab
 
-Machine-learning tools for fluorescence microscopy of endothelial cells and
-cardiomyocytes cultured on substrates of different stiffness, developed in
-Prof. Ngan Huang's lab. The repository holds two research tracks that share a
-codebase:
+Unsupervised discovery of recurring **spatial cell-neighbourhood motifs** in
+fluorescence microscopy of endothelial cells cultured on substrates of different
+stiffness, and how their frequencies shift with stiffness during
+endothelial-to-mesenchymal transition (EndMT). Developed in Prof. Ngan Huang's
+lab.
 
-| Track | Question | Status |
-|---|---|---|
-| **B — EndMT spatial-motif discovery** (`motifs/`) | Does substrate stiffness change *how endothelial-to-mesenchymal transition (EndMT) is organised in space* — are there recurring neighbourhood patterns invisible to the eye? | **Active.** Built end-to-end (segmentation → graphs → GNN encoder → motif clustering, validation, figures). |
-| **A — Cardiomyocyte detection** (`config/`, `data/`, `models/`, `training/`, `scripts/`) | Can a stiffness-conditioned masked autoencoder (MAE) pretrained on unlabelled z-stacks improve Deformable-DETR cell detection? | **Parked.** Infrastructure complete and tested; MAE→DETR backbone wiring and full-data training not done. |
-
-Track B is the current focus and is described below. Track A is documented in
-full in [docs/mae_detr_pipeline.md](docs/mae_detr_pipeline.md).
+Pipeline: Cellpose-SAM segmentation → per-cell features + EndMT score → one
+spatial graph per image → self-supervised GATv2 neighbourhood encoder →
+Leiden clustering into motifs → validation, robustness, and figures.
 
 ---
 
 ## Contents
 
-1. [Track B — EndMT spatial-motif pipeline](#1-track-b--endmt-spatial-motif-pipeline)
-   - [Aims and task definition](#aims-and-task-definition)
-   - [How the pipeline is used](#how-the-pipeline-is-used)
-   - [Why this design](#why-this-design)
-   - [What is new](#what-is-new)
-   - [Pipeline overview](#pipeline-overview)
-   - [Data](#data)
+1. [Aims and task definition](#1-aims-and-task-definition)
+2. [How the pipeline is used](#2-how-the-pipeline-is-used)
+3. [Why this design](#3-why-this-design)
+4. [What is new](#4-what-is-new)
+5. [Pipeline overview](#5-pipeline-overview)
+6. [Data](#6-data)
+7. [Stages](#7-stages)
    - [Stage 1 — Segmentation and per-cell features](#stage-1--segmentation-and-per-cell-features)
    - [Stage 2 — Master table and spatial graphs](#stage-2--master-table-and-spatial-graphs)
    - [Stage 3 — Self-supervised neighbourhood encoder](#stage-3--self-supervised-neighbourhood-encoder)
    - [Stage 4 — Motif clustering, validation and figures](#stage-4--motif-clustering-validation-and-figures)
-   - [What labels are (and are not) needed](#what-labels-are-and-are-not-needed)
-   - [Running the pipeline](#running-the-pipeline)
-   - [Results so far](#results-so-far)
-   - [Open questions](#open-questions)
-2. [Track A — MAE + Deformable-DETR detection](#2-track-a--mae--deformable-detr-detection)
-3. [Repository layout](#3-repository-layout)
-4. [Setup](#4-setup)
-5. [Documentation](#5-documentation)
-6. [Acknowledgements](#6-acknowledgements)
+8. [What labels are (and are not) needed](#8-what-labels-are-and-are-not-needed)
+9. [Running the pipeline](#9-running-the-pipeline)
+10. [Results so far](#10-results-so-far)
+11. [Open questions](#11-open-questions)
+12. [Repository layout](#12-repository-layout)
+13. [Setup](#13-setup)
+14. [Documentation](#14-documentation)
+15. [Acknowledgements](#15-acknowledgements)
 
 ---
 
-## 1. Track B — EndMT spatial-motif pipeline
-
-### Aims and task definition
+## 1. Aims and task definition
 
 **Big-picture goal.** We have thousands of microscope images of endothelial
 cells on substrates of different stiffness, and we want to find **recurring
@@ -72,7 +66,7 @@ that a biologist could name, look like:
 
 (These are the hypothesised catalogue from the project plan; the motifs the
 pipeline actually discovers are named *after* clustering by looking at examples
-— see [Results so far](#results-so-far).)
+— see [Results so far](#10-results-so-far).)
 
 **What a result looks like.** Two headline outputs:
 
@@ -87,7 +81,7 @@ pipeline actually discovers are named *after* clustering by looking at examples
   mesenchymal-cluster motifs grow and endothelial-sheet motifs shrink as the
   substrate stiffens, that is a spatial signature of stiffness-driven EndMT.
 
-### How the pipeline is used
+## 2. How the pipeline is used
 
 1. **Training phase** — images from *all* stiffness conditions are pooled into
    one training set and the GNN encoder is trained with a self-supervised
@@ -106,7 +100,7 @@ transition-focus cluster *regardless of which condition it came from*. One
 model, one motif vocabulary, applied uniformly to every image — so motif
 frequencies are comparable across conditions.
 
-### Why this design
+## 3. Why this design
 
 - **Why a GNN rather than a CNN on image crops?** A CNN on a patch around each
   cell learns from raw pixels but has no notion of which cells are neighbours or
@@ -128,7 +122,7 @@ frequencies are comparable across conditions.
   Decoupling them — learn a good embedding space first, then cluster — is more
   robust and much easier to validate.
 
-### What is new
+## 4. What is new
 
 Spatial-neighbourhood analysis exists in spatial omics, but the existing tools
 do not fit this problem:
@@ -142,7 +136,7 @@ do not fit this problem:
 3. None of them handle **substrate stiffness** as an experimental axis; they are
    designed for clinical / anatomical comparisons.
 
-### Pipeline overview
+## 5. Pipeline overview
 
 ```
 Stage 1                 Stage 2                  Stage 3                    Stage 4
@@ -192,7 +186,7 @@ never on features, and raw (x, y) is never a node feature. Condition labels
 (stiffness, nicotine, ECM, imaging date) are graph-level tags only, so the
 encoder cannot trivially learn them.
 
-### Data
+## 6. Data
 
 - Three-channel fluorescence tiles (682 × 682 px) of endothelial monolayers.
   Tiles are stored in RGB-plane order **R = TAGLN** (mesenchymal marker),
@@ -219,6 +213,8 @@ should be re-run on them.
 The local working root is resolved in this order: `$CELLPOSE_LOCAL_ROOT`, the
 Lightning path `/teamspace/studios/this_studio/cellpose_work`, else
 `~/cellpose_work`.
+
+## 7. Stages
 
 ### Stage 1 — Segmentation and per-cell features
 
@@ -274,7 +270,7 @@ Output: `stage3/encoder.pt`, `stage3/embeddings.parquet`, `stage3/probe_report.j
 | `plot_motif_maps.py` | Paints motif labels back onto tissue: per-image motif map beside the original tile, paired grids across conditions, per-motif EndMT breakdowns, a **motif catalog** and per-motif **galleries** of ego-subgraphs. |
 | `plot_motif_frequency.py` | The headline figure: stacked bars of motif proportion per condition ordered by stiffness, plus grouped bars with ± SEM across images. `--merge-by-stiffness` pools the two 500 kPa dates; `--labels` names the motifs. |
 
-### What labels are (and are not) needed
+## 8. What labels are (and are not) needed
 
 Motif discovery is unsupervised, so almost nothing has to be hand-annotated.
 
@@ -292,14 +288,12 @@ be defined purely by morphology and arrangement, with no biological context —
 the EndMT story would be much weaker. Tier 3 is what lets us *make claims*
 about the results rather than just produce them.
 
-### Running the pipeline
+## 9. Running the pipeline
 
 All commands are run from the repository root. Stage 1 needs a GPU for
 Cellpose; Stage 3 training is GPU-recommended; everything else is CPU.
 
 ```bash
-pip install -r requirements-motifs.txt
-
 # Stage 1 — on Lightning AI (or Colab via the notebooks)
 python motifs/stage1_segmentation/lightning_cellpose_batch.py
 python motifs/stage1_segmentation/automated_cellwise_feature_extraction.py
@@ -329,7 +323,7 @@ python motifs/stage4_motifs/plot_motif_frequency.py --motifs <root>/stage4/motif
 Every script has `--help`; each writes a JSON report and/or a log alongside its
 figures so a run is self-describing.
 
-### Results so far
+## 10. Results so far
 
 Findings from the latest full run (internally "v4"); the run artefacts live on
 Drive / Lightning, not in git.
@@ -350,13 +344,13 @@ Drive / Lightning, not in git.
   each centroid, report each motif's mean composition, and have a biologist
   look at the examples).
 
-### Open questions
+## 11. Open questions
 
 - **Marker panel.** Three channels (VE-cadherin, TAGLN, DAPI) are enough to
   score EndMT, but CD31, vimentin or N-cadherin would add confidence to the
   cell-state calls and richer node features.
 - **Raw data.** The current tiles are 8-bit RGB exports (see
-  [Data](#data)); 16-bit multi-channel acquisitions would restore dynamic range
+  [Data](#6-data)); 16-bit multi-channel acquisitions would restore dynamic range
   and remove the need for a hand-maintained channel map.
 - **Graph definition.** kNN (k = 8) is the current edge rule. Delaunay
   triangulation or a radius graph would connect only cells that share a tissue
@@ -366,67 +360,33 @@ Drive / Lightning, not in git.
 
 ---
 
-## 2. Track A — MAE + Deformable-DETR detection
-
-A two-stage detector for cardiomyocytes on 5 kPa vs 900 kPa substrates
-(444 wells, each with a 35-plane × 4-channel z-stack, a focus-stacked image and
-a hybrid projection):
-
-1. **Self-supervised pretraining** — three masked autoencoders (2D focused, 2D
-   hybrid, 3D tubelet-patched z-stack) trained jointly, all conditioned on
-   substrate stiffness through a shared `StiffnessMLP`.
-2. **Detection fine-tuning** — Deformable-DETR (`SenseTime/deformable-detr`)
-   on bounding-box labels, with mAP / AP50 / AP75 / mean-IoU evaluation.
-
-The full write-up — data layout, architecture, configuration reference,
-metrics and commands — is in [docs/mae_detr_pipeline.md](docs/mae_detr_pipeline.md).
-
-```bash
-pip install -r requirements.txt
-python scripts/train_pretrain.py --smoke     # forward/backward on random tensors, ~10 s on CPU
-pytest tests/ -v                             # 20 synthetic-data integration tests
-```
-
-**Status:** the pipeline runs end-to-end and the tests pass, but the detector
-still uses the stock ResNet-50 backbone — wiring the pretrained MAE ViT into
-the DETR feature pyramid (`models/weight_loaders.py`,
-`detection.mae_encoder_ckpt`) is unfinished, and no full-dataset mAP has been
-recorded.
-
----
-
-## 3. Repository layout
+## 12. Repository layout
 
 ```
 Huang-Lab-Work/
-├── README.md                     ← this file
-├── requirements.txt              Track A dependencies
-├── requirements-motifs.txt       Track B dependencies
+├── README.md
+├── requirements.txt
 │
-├── motifs/                       TRACK B — EndMT spatial-motif pipeline
-│   ├── stage1_segmentation/      Cellpose-SAM + per-cell features + EndMT score
-│   ├── stage2_graphs/            master table + kNN spatial graphs
-│   ├── stage3_encoder/           subgraph sampling, GATv2 training, embedding, confound probe
-│   └── stage4_motifs/            clustering, validation, robustness, baseline, figures
+├── motifs/
+│   ├── stage1_segmentation/      Cellpose-SAM batch segmentation, per-cell features + EndMT score,
+│   │                             Colab / Lightning notebooks
+│   ├── stage2_graphs/            master table (global z-score) + kNN spatial graphs + QC
+│   ├── stage3_encoder/           2-hop subgraph sampling, GATv2 contrastive training,
+│   │                             per-cell embedding, confound probe
+│   └── stage4_motifs/            Leiden clustering, validation, robustness, no-neighbour
+│                                 baseline, motif maps / catalog / galleries, frequency figure
 │
-├── models/                       Shared model code
-│   ├── neighborhood_encoder.py   Track B: GATv2 encoder, NT-Xent, adversary, EndMT head
-│   └── mae.py, mae_volume.py, multi_mae.py, stiffness.py, pos_embed.py, weight_loaders.py   (Track A)
+├── models/
+│   └── neighborhood_encoder.py   GATv2 encoder + projection head, NT-Xent loss,
+│                                 gradient-reversal condition adversary, EndMT head
 │
-├── config/   data/   training/   scripts/   utils/   tests/     TRACK A packages
-├── notebooks/colab_train.ipynb   Track A Colab GPU training notebook
-│
-├── docs/
-│   ├── mae_detr_pipeline.md              Track A: full documentation
-│   ├── stage2_graph_construction.md      Track B: graph design + QC
-│   ├── stage3_gnn_encoder.md             Track B: encoder + contrastive training plan
-│   └── stage3_encoder_methodology.md     Track B: design rationale, alternatives considered
-│
-└── archive/                      Read-only reference: original Colab dataloaders and the
-                                  vendored facebookresearch/mae tree (CC-BY-NC-4.0)
+└── docs/
+    ├── stage2_graph_construction.md      graph design, node/edge contract, QC suite
+    ├── stage3_gnn_encoder.md             encoder + contrastive training plan
+    └── stage3_encoder_methodology.md     design rationale and alternatives considered
 ```
 
-## 4. Setup
+## 13. Setup
 
 ```bash
 git clone https://github.com/racyun/Huang-Lab-Work.git
@@ -434,39 +394,32 @@ cd Huang-Lab-Work
 python -m venv .venv && source .venv/bin/activate
 
 # PyTorch first, matching your CUDA version: https://pytorch.org/get-started/locally/
-pip install torch torchvision
+pip install torch
 
-pip install -r requirements-motifs.txt   # Track B
-pip install -r requirements.txt          # Track A (optional)
+pip install -r requirements.txt
 ```
 
-Track B scripts read and write under `<root>` (see [Data](#data)); Track A
-takes machine-specific paths from `config/local.yaml`
-(`cp config/local.yaml.example config/local.yaml`, gitignored).
+Scripts read and write under `<root>` (see [Data](#6-data)); set
+`CELLPOSE_LOCAL_ROOT` to override the default location. For Lightning AI, the
+one-time `rclone` setup for the Google Drive remote is documented at the top of
+`motifs/stage1_segmentation/lightning_cellpose_batch.py`.
 
-For Lightning AI, the one-time `rclone` setup for the Drive remote is
-documented at the top of `motifs/stage1_segmentation/lightning_cellpose_batch.py`.
-
-## 5. Documentation
+## 14. Documentation
 
 | Document | Covers |
 |---|---|
 | [docs/stage2_graph_construction.md](docs/stage2_graph_construction.md) | Why kNN-on-centroids, the node/edge feature contract, QC suite, gap analysis against Stage 1 |
 | [docs/stage3_gnn_encoder.md](docs/stage3_gnn_encoder.md) | Ego-subgraph sampling, GATv2 encoder, augmentations, NT-Xent, adversary, how to run |
 | [docs/stage3_encoder_methodology.md](docs/stage3_encoder_methodology.md) | Every design decision with the alternatives it beats (GNN vs MLP/CNN, GAT vs GCN, contrastive vs autoencoding, …) |
-| [docs/mae_detr_pipeline.md](docs/mae_detr_pipeline.md) | Track A end to end: data, MAE variants, stiffness conditioning, DETR fine-tuning, config reference |
 
-## 6. Acknowledgements
+## 15. Acknowledgements
 
 - **Cellpose-SAM** — Pachitariu, M., Rariden, M. & Stringer, C. (2025). Cellpose-SAM: superhuman generalization for cellular segmentation.
 - **GATv2** — Brody, S., Alon, U. & Yahav, E. (2022). How Attentive are Graph Attention Networks? (ICLR). Via PyTorch Geometric.
 - **NT-Xent / SimCLR** — Chen, T., Kornblith, S., Norouzi, M. & Hinton, G. (2020). A Simple Framework for Contrastive Learning of Visual Representations.
 - **Leiden** — Traag, V. A., Waltman, L. & van Eck, N. J. (2019). From Louvain to Leiden. Via `leidenalg` / `python-igraph`.
 - **UMAP** — McInnes, L., Healy, J. & Melville, J. (2018).
-- **MAE** — He, K. et al. (2021). Masked Autoencoders Are Scalable Vision Learners. The vendored codebase in `archive/legacy_facebook_mae/` is CC-BY-NC-4.0, Meta Platforms, Inc.
-- **VideoMAE** — Tong, Z. et al. (2022); inspiration for the 3D tubelet masking.
-- **Deformable DETR** — Zhu, X. et al. (2020); weights from the HuggingFace `SenseTime/deformable-detr` checkpoint.
-- **timm** — Wightman, R. (2019).
+- **PyTorch Geometric** — Fey, M. & Lenssen, J. E. (2019).
 
 Developed in Prof. Ngan Huang's lab; channel maps and the EndMT scoring
 convention follow the lab's protocol.

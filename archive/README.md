@@ -1,1 +1,0 @@
-This folder preserves the previous Colab dataloaders and the vendored [facebookresearch/mae](https://github.com/facebookresearch/mae) tree (classification fine-tuning, Slurm scripts, ImageFolder pretrain) for reference. Active development uses the top-level `config/`, `data/`, `models/`, `scripts/`, and `utils/` packages instead.

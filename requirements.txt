@@ -1,22 +1,27 @@
-# Tested together: torch 2.5.x + timm 1.0.26 (CPU/GPU). Adjust torch for your CUDA wheel.
-torch>=2.1.0,<2.7.0
-torchvision>=0.16.0,<0.22.0
-timm>=1.0.12,<2.0.0
-PyYAML>=6.0.1
-Pillow>=10.0.0
-numpy>=1.24.0,<3.0.0
-transformers>=4.36.0,<5.0.0
-accelerate>=0.25.0
-# Optional: pycocotools for COCO metrics
-# pycocotools>=2.0.7
+# EndMT spatial-motif pipeline. Install on top of a PyTorch build that
+# matches your CUDA version: https://pytorch.org/get-started/locally/
+#
+# torch_geometric may need the matching wheel index for scatter/sparse ops:
+#   https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
 
-# Experiment tracking
-wandb>=0.16.0
+torch>=2.1.0
+torch_geometric>=2.4.0
+numpy
+pandas
+pyarrow                 # embeddings.parquet / motifs.parquet
+scipy
+scikit-learn
+scikit-image            # Stage 1 feature extraction
+tifffile                # Stage 1 + motif-map figures
+matplotlib
+umap-learn              # Stage 3 QC + Stage 4 reduction
+leidenalg               # Stage 4 Leiden clustering (k-means fallback if absent)
+python-igraph
+tqdm
 
-# Detection metrics
-torchmetrics[detection]>=1.0.0   # includes pycocotools dependency
-faster-coco-eval>=1.5.0          # optional: ~10x faster mAP computation on CPU
-scipy>=1.10.0                    # required by Deformable-DETR Hungarian matcher
+# Stage 1 segmentation only (GPU recommended)
+# cellpose>=4.0           # Cellpose-SAM
+# numpy<2.0               # cellpose pin at time of writing
 
-# Testing
-pytest>=7.0
+# Optional
+# wandb                   # --wandb on train_encoder.py
