@@ -253,19 +253,19 @@ def nt_xent(z1, z2, tau=0.2):
 
 ---
 
-## 12. How to run (planned scripts)
+## 12. How to run
 
 ```bash
 pip install torch torch_geometric pandas pyarrow umap-learn scikit-learn
 
 # 1. train the encoder (contrastive; --adversarial only if the probe says so)
-python train_encoder.py --epochs 100 --emb-dim 64 --hops 2
+python motifs/stage3_encoder/train_encoder.py --epochs 100 --emb-dim 64 --hops 2
 
 # 2. embed every cell with the frozen encoder -> embeddings.parquet
-python embed_cells.py --encoder stage3/encoder.pt
+python motifs/stage3_encoder/embed_cells.py --encoder stage3/encoder.pt
 
 # 3. confound probe + UMAPs (QC §9)
-python probe_embeddings.py
+python motifs/stage3_encoder/probe_embeddings.py
 ```
 
 Add `--push-to-drive` to back up `encoder.pt` + `embeddings.parquet` (Studios

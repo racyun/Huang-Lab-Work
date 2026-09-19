@@ -36,6 +36,7 @@ import math
 import os
 import random
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -45,7 +46,13 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import k_hop_subgraph
 
-from models.neighborhood_encoder import (
+# Make the repo root importable so `models.neighborhood_encoder` resolves when
+# this script is run directly from any working directory.
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from models.neighborhood_encoder import (  # noqa: E402
     NeighborhoodEncoder, ConditionAdversary, EndMTHead,
     nt_xent_loss, batchnorm_intensities_,
 )

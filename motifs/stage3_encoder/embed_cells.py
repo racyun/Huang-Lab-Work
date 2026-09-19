@@ -29,6 +29,7 @@ import glob
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,13 @@ import torch
 from torch_geometric.data import Batch, Data
 from torch_geometric.utils import k_hop_subgraph
 
-from models.neighborhood_encoder import NeighborhoodEncoder, batchnorm_intensities_
+# Make the repo root importable so `models.neighborhood_encoder` resolves when
+# this script is run directly from any working directory.
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from models.neighborhood_encoder import NeighborhoodEncoder, batchnorm_intensities_  # noqa: E402
 
 DRIVE_ROOT = "Fusion AI/Prof Huang Project/Cellpose feature extractions"
 

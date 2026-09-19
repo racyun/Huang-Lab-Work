@@ -1,769 +1,472 @@
-# Huang Lab — Tissue-on-a-Chip Cardiovascular Imaging Pipeline
+# Huang Lab — AI for Cardiovascular Tissue-on-a-Chip Microscopy
 
-This repository implements an end-to-end machine learning pipeline for automatically detecting and localizing cells in microscopy images of cardiovascular tissue-on-a-chip experiments. The pipeline has two stages: first, it learns rich visual representations from unlabelled microscopy images using a technique called **Masked Autoencoding (MAE)**; then it uses those representations to fine-tune a **Deformable-DETR** object detector to predict bounding boxes around individual cells. The data comes from chips seeded with cardiomyocytes grown on substrates of two different mechanical stiffnesses (5 kPa and 900 kPa), and the model is designed to handle both conditions simultaneously.
+Machine-learning tools for fluorescence microscopy of endothelial cells and
+cardiomyocytes cultured on substrates of different stiffness, developed in
+Prof. Ngan Huang's lab. The repository holds two research tracks that share a
+codebase:
 
----
-
-## Table of Contents
-
-1. [Overview](#1-overview)
-2. [Data](#2-data)
-3. [Model Architecture](#3-model-architecture)
-   - [What is MAE?](#what-is-mae-masked-autoencoding)
-   - [Focused Encoder (2D MAE)](#focused-encoder-2d-mae)
-   - [Hybrid Encoder (2D MAE)](#hybrid-encoder-2d-mae)
-   - [Volume Encoder (3D MAE)](#volume-encoder-3d-mae)
-   - [Stiffness Conditioning](#stiffness-conditioning)
-   - [Multi-Encoder Wrapper](#multi-encoder-wrapper)
-   - [What is Deformable-DETR?](#what-is-deformable-detr)
-   - [Detection Fine-tuning](#detection-fine-tuning)
-4. [Training Pipeline](#4-training-pipeline)
-5. [Evaluation Metrics](#5-evaluation-metrics)
-6. [Project Structure](#6-project-structure)
-7. [Setup and Running](#7-setup-and-running)
-8. [Configuration](#8-configuration)
-9. [Results So Far](#9-results-so-far)
-10. [Acknowledgements](#10-acknowledgements)
-
----
-
-## 1. Overview
-
-Tissue-on-a-chip experiments produce large volumes of microscopy images. Manually annotating every cell in every image is time-consuming and does not scale. This project automates that process with a two-stage deep learning pipeline:
-
-```
-Stage 1: Self-supervised Pretraining (MAE)
-─────────────────────────────────────────
-Raw microscopy images (no labels needed)
-        │
-        ▼
-  Three parallel encoders learn to
-  reconstruct masked image patches
-        │
-        ▼
-  Encoders now "understand" cell
-  structure and tissue morphology
-
-Stage 2: Detection Fine-tuning (Deformable-DETR)
-─────────────────────────────────────────────────
-Pretrained encoder weights
-        │
-        ▼
-  Fine-tune on labelled bounding boxes
-        │
-        ▼
-  Model predicts cell locations
-  in new images
-```
-
-A key design feature is **stiffness conditioning**: the model knows whether each image comes from a 5 kPa (soft) or 900 kPa (stiff) substrate and uses that information when processing images. This matters because cells grown on substrates of different stiffnesses can look and behave differently.
-
----
-
-## 2. Data
-
-### Experimental Setup
-
-Each experiment well contains cardiomyocytes imaged at multiple focal planes (z-slices) using fluorescence microscopy. There are 222 wells per stiffness condition, giving **444 total samples** across two conditions:
-
-- **900 kPa** — stiff substrate (mimics scar tissue stiffness)
-- **5 kPa** — soft substrate (closer to healthy heart tissue stiffness)
-
-### Three Image Modalities
-
-For each well, three different image representations are available:
-
-| Modality | Description | Shape |
+| Track | Question | Status |
 |---|---|---|
-| **Z-stack** | Full 3D volume: 35 focal planes × 4 fluorescence channels = 140 TIFF files | `[140, H, W]` |
-| **Focused** | A single sharp 2D image computed by merging the sharpest parts of each z-level across the stack | `[C, H, W]` |
-| **Hybrid** | A projection that combines fluorescence channels into a single composite view | `[C, H, W]` |
+| **B — EndMT spatial-motif discovery** (`motifs/`) | Does substrate stiffness change *how endothelial-to-mesenchymal transition (EndMT) is organised in space* — are there recurring neighbourhood patterns invisible to the eye? | **Active.** Built end-to-end (segmentation → graphs → GNN encoder → motif clustering, validation, figures). |
+| **A — Cardiomyocyte detection** (`config/`, `data/`, `models/`, `training/`, `scripts/`) | Can a stiffness-conditioned masked autoencoder (MAE) pretrained on unlabelled z-stacks improve Deformable-DETR cell detection? | **Parked.** Infrastructure complete and tested; MAE→DETR backbone wiring and full-data training not done. |
 
-Think of the z-stack as a full 3D scan of the tissue, the focused image as the "best 2D photo" you could take of it, and the hybrid image as a specially processed composite view emphasizing different biological structures.
-
-### Data Directory Layout
-
-All data lives under a parent directory (`250918_Deepmind_CV_Collaboration/`) with this structure:
-
-```
-250918_Deepmind_CV_Collaboration/
-│
-├── 250811_Athchip_noninflam_900kPa/              # Raw z-stack images, 900 kPa
-│   ├── W001/P00001/
-│   │   ├── 10X_W001_P00001_Z001_CH1.tif          # Z-slice 1, channel 1
-│   │   ├── 10X_W001_P00001_Z001_CH2.tif          # Z-slice 1, channel 2
-│   │   ├── 10X_W001_P00001_Z001_CH3.tif
-│   │   ├── 10X_W001_P00001_Z001_Overlay.tif
-│   │   └── ... (35 z-levels × 4 channels = 140 files per well)
-│   ├── W002/P00001/
-│   └── ... W222/P00001/
-│
-├── 250814_Athchip_non-inflam_5kPa/               # Raw z-stack images, 5 kPa
-│   └── (same structure)
-│
-├── 20251027_2123__FocusStack_250811_..._900kPa/  # Focus-stacked images, 900 kPa
-│   ├── ..._W001_P00001_focus_stacked.tif         # One file per well (flat folder)
-│   └── ...
-│
-├── 20251027_2215__FocusStack_250814_..._5kPa/    # Focus-stacked images, 5 kPa
-│   └── (same structure)
-│
-├── 250811_Athchip_noninflam_900kPa_HybridResults/  # Hybrid projections, 900 kPa
-│   ├── hybrid_results_W001/
-│   │   └── W001_hybrid_projection.tif
-│   └── ... hybrid_results_W222/
-│
-├── 250814_Athchip_non-inflam_5kPa_HybridResults/   # Hybrid projections, 5 kPa
-│   └── (same structure)
-│
-└── bbox_txt_for_training/                          # Bounding box labels
-    ├── 900kPa/
-    │   ├── W001.txt    # One line per box: x1,y1,x2,y2
-    │   └── ... W222.txt
-    └── 5kPa/
-        └── ...
-```
-
-### Bounding Box Labels
-
-Label files contain one bounding box per line in pixel coordinates:
-
-```
-x1,y1,x2,y2
-10.0,20.0,50.0,60.0
-130.5,80.0,200.0,145.0
-```
-
-The detection pipeline automatically converts these to normalized center-x, center-y, width, height format (values between 0 and 1) as required by Deformable-DETR.
-
-### Well Discovery and Alignment
-
-The data loader (`data/combined.py`) builds the well list by **intersection**: a well is only included in training if it has all four components — a z-stack folder, a focused image, a hybrid image, and a label file. This handles cases where a small number of wells may be missing from one modality without manual intervention.
+Track B is the current focus and is described below. Track A is documented in
+full in [docs/mae_detr_pipeline.md](docs/mae_detr_pipeline.md).
 
 ---
 
-## 3. Model Architecture
+## Contents
 
-### What is MAE? (Masked Autoencoding)
+1. [Track B — EndMT spatial-motif pipeline](#1-track-b--endmt-spatial-motif-pipeline)
+   - [Aims and task definition](#aims-and-task-definition)
+   - [How the pipeline is used](#how-the-pipeline-is-used)
+   - [Why this design](#why-this-design)
+   - [What is new](#what-is-new)
+   - [Pipeline overview](#pipeline-overview)
+   - [Data](#data)
+   - [Stage 1 — Segmentation and per-cell features](#stage-1--segmentation-and-per-cell-features)
+   - [Stage 2 — Master table and spatial graphs](#stage-2--master-table-and-spatial-graphs)
+   - [Stage 3 — Self-supervised neighbourhood encoder](#stage-3--self-supervised-neighbourhood-encoder)
+   - [Stage 4 — Motif clustering, validation and figures](#stage-4--motif-clustering-validation-and-figures)
+   - [What labels are (and are not) needed](#what-labels-are-and-are-not-needed)
+   - [Running the pipeline](#running-the-pipeline)
+   - [Results so far](#results-so-far)
+   - [Open questions](#open-questions)
+2. [Track A — MAE + Deformable-DETR detection](#2-track-a--mae--deformable-detr-detection)
+3. [Repository layout](#3-repository-layout)
+4. [Setup](#4-setup)
+5. [Documentation](#5-documentation)
+6. [Acknowledgements](#6-acknowledgements)
 
-Masked Autoencoding is a self-supervised learning technique — meaning the model trains itself without needing human-annotated labels. The idea is borrowed from masked language modeling in NLP (like how BERT learns by predicting missing words in a sentence), but applied to images.
+---
 
-Here is how it works:
+## 1. Track B — EndMT spatial-motif pipeline
+
+### Aims and task definition
+
+**Big-picture goal.** We have thousands of microscope images of endothelial
+cells on substrates of different stiffness, and we want to find **recurring
+spatial patterns in how cells are arranged near each other** — and how those
+patterns shift as stiffness changes. A computer cannot simply look at the images
+and "find patterns"; we have to tell it what to look at. We do that by turning
+each image into a **graph** whose nodes are cells and whose edges connect
+spatial neighbours, training a neural network to recognise which local
+neighbourhoods look alike, and grouping similar neighbourhoods together. Each
+group is one **motif**.
+
+**Why neighbourhoods, not cells.** EndMT is usually scored one cell at a time
+(how mesenchymal is *this* cell?). That discards the spatial context — whether a
+transitioning cell sits alone inside an endothelial sheet, clusters with others,
+or lines a front between endothelial and mesenchymal regions. Motifs capture
+exactly that context. The kinds of motifs we expect the method to surface, and
+that a biologist could name, look like:
+
+| Expected motif | Neighbourhood composition |
+|---|---|
+| Endothelial sheet | all endothelial, no transition |
+| Transition focus | one transitioning cell surrounded by endothelial cells |
+| Isolated transition | a lone transitioning cell with few neighbours |
+| Mixed interface | endothelial, transitioning and mesenchymal cells side by side |
+| Transition front | a line of transitioning cells between the two states |
+| Mesenchymal cluster | all mesenchymal |
+
+(These are the hypothesised catalogue from the project plan; the motifs the
+pipeline actually discovers are named *after* clustering by looking at examples
+— see [Results so far](#results-so-far).)
+
+**What a result looks like.** Two headline outputs:
+
+- **Motif maps** — the original tile with every cell coloured by the motif its
+  neighbourhood was assigned to. One dot = one segmented cell at its real
+  position; the colour = the motif label for that cell's *surroundings*.
+  Neighbouring cells usually share a motif because they share most of the same
+  neighbourhood, so the maps show contiguous coloured domains rather than
+  salt-and-pepper noise.
+- **Motif frequency across stiffness** — stacked bars of the proportion of each
+  condition's cells in each motif. This is the scientific claim: if, say,
+  mesenchymal-cluster motifs grow and endothelial-sheet motifs shrink as the
+  substrate stiffens, that is a spatial signature of stiffness-driven EndMT.
+
+### How the pipeline is used
+
+1. **Training phase** — images from *all* stiffness conditions are pooled into
+   one training set and the GNN encoder is trained with a self-supervised
+   contrastive objective (no labels). The result is an encoder that maps any
+   neighbourhood to an embedding vector.
+2. **Motif-discovery phase** — the trained encoder is run over every
+   neighbourhood from every condition, and the combined embedding space is
+   clustered. Those clusters are the motifs; each motif is defined by
+   neighbourhoods drawn from across all stiffnesses.
+3. **Inference phase** — given a new image at any stiffness, run it through the
+   encoder and assign each cell to its nearest motif centroid.
+
+The point of pooling and of the de-confounding machinery in Stage 3 is that a
+neighbourhood that structurally looks like "transition focus" lands near the
+transition-focus cluster *regardless of which condition it came from*. One
+model, one motif vocabulary, applied uniformly to every image — so motif
+frequencies are comparable across conditions.
+
+### Why this design
+
+- **Why a GNN rather than a CNN on image crops?** A CNN on a patch around each
+  cell learns from raw pixels but has no notion of which cells are neighbours or
+  what their properties are, and it re-introduces staining and focus nuisances
+  we deliberately distilled away in Stages 1–2. The GNN operates directly on
+  the graph of cells with known features, so it learns from spatial
+  relationships between cells with known properties — far more biologically
+  meaningful and interpretable.
+- **Why attention (GAT)?** When updating a cell's representation the model
+  learns how much weight to give each neighbour, and those attention weights
+  can be inspected afterwards to see which neighbours mattered — useful for
+  characterising motifs.
+- **Why self-supervised contrastive rather than supervised?** We cannot label
+  motifs because we do not know what they are — discovering them is the task.
+  Contrastive learning builds a meaningful embedding space from the structure of
+  the data alone.
+- **Why cluster after training rather than jointly?** Joint representation
+  learning + clustering exists but is harder to train and less stable.
+  Decoupling them — learn a good embedding space first, then cluster — is more
+  robust and much easier to validate.
+
+### What is new
+
+Spatial-neighbourhood analysis exists in spatial omics, but the existing tools
+do not fit this problem:
+
+1. They were built for **multiplexed** spatial omics (CODEX, IMC, spatial
+   transcriptomics) with 20–40 markers per cell. Here the same ideas are applied
+   to **conventional fluorescence imaging with 3 markers** — a genuinely
+   different input format.
+2. They are built around static tissue snapshots for cancer-vs-healthy
+   comparison, not for studying a **transition process** such as EndMT.
+3. None of them handle **substrate stiffness** as an experimental axis; they are
+   designed for clinical / anatomical comparisons.
+
+### Pipeline overview
 
 ```
-Original image patches:
-[ A ][ B ][ C ][ D ][ E ][ F ][ G ][ H ]
-
-After random masking (75% masked):
-[ A ][   ][   ][ D ][   ][   ][ G ][   ]
-
-Encoder sees only unmasked patches (25%):
-[ A ][ D ][ G ]  →  Encoder  →  Representations
-
-Decoder tries to reconstruct everything:
-  Representations + mask tokens  →  Decoder  →  [ A ][ B* ][ C* ][ D ][ E* ][ F* ][ G ][ H* ]
-
-Loss: MSE between B* vs B, C* vs C, etc. (masked patches only)
+Stage 1                 Stage 2                  Stage 3                    Stage 4
+───────                 ───────                  ───────                    ───────
+tiles ─► Cellpose-SAM   per-image CSVs ─►        graphs ─► 2-hop ego        embeddings ─► UMAP + Leiden
+      ─► masks               master table          subgraphs ─► GATv2         ─► motif per cell
+      ─► per-cell            (global z-score)      encoder (NT-Xent,          ─► validation / robustness
+         features       ─► kNN graph per image     optional adversary)        ─► motif maps, catalog,
+         + EndMT score     (nodes=cells,          ─► 64-d embedding              frequency-by-condition
+                            edges=adjacency)         per cell
 ```
 
-The reason this works is that to fill in the missing 75% of an image, the model must learn to understand the actual structure and content of the image — it cannot just memorize the input. After pretraining, the encoder has learned rich, generalizable visual representations without ever seeing a single label.
+In plain language, the six steps the code implements:
 
-### The Full Architecture at a Glance
+1. **Per-cell feature vectors** — for every cell in every image, record its
+   brightness in each channel, size, elongation, and a 0-to-1 score for how
+   "endothelial vs. mesenchymal" it looks. Each cell becomes one row of numbers
+   so cells can be compared quantitatively.
+2. **Graph construction** — in each image, draw a line from every cell to its
+   *k* = 8 closest cells (by centre-to-centre distance) and store the distance
+   on each line. Keeping *k* small (6–10) is deliberate: connect cells that are
+   too far apart and motifs end up reflecting whole-image composition rather
+   than the immediate microenvironment.
+3. **Neighbourhood subgraphs** — for every cell, cut out the cell, its
+   neighbours, and its neighbours' neighbours (2 hops, roughly 15–30 cells).
+   This is the unit that gets a motif. 1 hop is too little context; 3+ hops
+   blurs into tissue scale.
+4. **GNN encoder** — three graph-attention layers compress a subgraph of any
+   size into one fixed-length vector. Each layer lets every cell update its
+   representation from its neighbours, weighting them by learned attention;
+   after three layers each cell has "seen" three hops out. A readout pools all
+   cells into a single neighbourhood embedding.
+5. **Contrastive training** — take a neighbourhood, make two slightly perturbed
+   copies (drop a few edges, hide some features, drop outer cells, add noise),
+   and train the encoder to embed the two copies close together while pushing
+   other neighbourhoods away (NT-Xent loss). The encoder learns which properties
+   survive perturbation — cell composition, spatial organisation, local
+   interaction patterns — and those become the basis of similarity.
+6. **Clustering** — embed every cell, optionally UMAP-reduce 64 → ~10 dims,
+   build a kNN similarity graph over embeddings, run Leiden. Each cluster is a
+   motif; every cell gets a label; the labels feed the motif catalogue, motif
+   maps and cross-stiffness statistics.
 
-```
-                     ┌─────────────────────────────────────────────┐
-                     │         STAGE 1: MAE Pretraining             │
-                     │                                               │
-  Focused image  ──► │  Focused Encoder (2D ViT)  ──► Decoder ──►  │ loss_focused
-  Hybrid image   ──► │  Hybrid Encoder  (2D ViT)  ──► Decoder ──►  │ loss_hybrid
-  Z-stack volume ──► │  Volume Encoder  (3D ViT)  ──► Decoder ──►  │ loss_volume
-  Stiffness kPa  ──► │  StiffnessMLP ──────────────────────────►   │
-                     │              (injected into all encoders)     │
-                     │                                               │
-                     │  Total loss = loss_f + loss_h + loss_v        │
-                     └─────────────────────────────────────────────┘
-                                         │
-                              Pretrained focused encoder
-                                         │
-                     ┌─────────────────────────────────────────────┐
-                     │       STAGE 2: Detection Fine-tuning         │
-                     │                                               │
-  Focused image  ──► │  Backbone (initialized from pretrained enc.) │
-                     │  ──► Deformable-DETR neck + detection head   │
-                     │  ──► 300 object queries                       │
-                     │  ──► Predicted bounding boxes + class scores  │
-                     └─────────────────────────────────────────────┘
-```
+The one design principle carried through every stage: **features ride on
+nodes, geometry defines edges.** Nearest neighbours are computed on centroids,
+never on features, and raw (x, y) is never a node feature. Condition labels
+(stiffness, nicotine, ECM, imaging date) are graph-level tags only, so the
+encoder cannot trivially learn them.
 
-### Focused Encoder (2D MAE)
+### Data
 
-**File:** `models/mae.py` — `MaskedAutoencoderViT` / `MAEViTEncoder`
+- Three-channel fluorescence tiles (682 × 682 px) of endothelial monolayers.
+  Tiles are stored in RGB-plane order **R = TAGLN** (mesenchymal marker),
+  **G = VE-cadherin** (endothelial junction marker), **B = DAPI** (nuclei).
+- Conditions: substrates of **5, 150, 500 (two imaging dates), and 900 kPa**
+  plus tissue-culture plastic; ~6 000 tiles, ~1.27 M cells in total.
+- Images, masks and per-cell CSVs live on Google Drive
+  (`Fusion AI/Prof Huang Project/Cellpose feature extractions/`) and are
+  synced to a Lightning AI Studio with `rclone`. Every script takes a
+  `--push-to-drive` flag to back its outputs up, since Studios are ephemeral.
+- Per-well metadata (stiffness, nicotine / no nicotine, ECM coating, imaging
+  date) is carried as a graph-level `condition` tag, never as a node feature.
+- Nothing large is committed to git: no images, masks, graphs, checkpoints or
+  run outputs.
 
-This encoder processes the focus-stacked image — a single sharp 2D image representing the full tissue in one plane.
+**File-format caveat.** The tiles are standard **8-bit RGB TIFFs**, not
+scientific multi-channel TIFFs: the original acquisitions were almost certainly
+12/16-bit per channel, have been compressed to 0–255 and pseudo-coloured, and
+carry no embedded metadata saying which channel is which marker (the channel
+map above comes from the lab). Dynamic range has been lost. If raw acquisition
+files (16-bit per channel with OME metadata) become available, the pipeline
+should be re-run on them.
 
-The encoder is a **Vision Transformer (ViT)**. Here is what that means in plain terms:
+The local working root is resolved in this order: `$CELLPOSE_LOCAL_ROOT`, the
+Lightning path `/teamspace/studios/this_studio/cellpose_work`, else
+`~/cellpose_work`.
 
-1. **Patch Embedding**: The image is divided into a grid of non-overlapping 16×16 pixel patches. Each patch is linearly projected into a vector of size 384 (the `embed_dim`). A 224×224 image produces (224/16)² = 196 patches.
+### Stage 1 — Segmentation and per-cell features
 
-2. **Positional Encoding**: Because transformers process all patches simultaneously (not in order), each patch vector gets a unique positional signal added to it so the model knows where each patch came from in the image. These are fixed sinusoidal encodings, not learned.
+`motifs/stage1_segmentation/`
 
-3. **Stiffness Injection**: The stiffness embedding (see below) is added to every patch vector before the transformer processes them.
+| File | What it does |
+|---|---|
+| `lightning_cellpose_batch.py` | Runs **Cellpose-SAM** over every tile, writes one label mask per tile. Resumable; skips tiles that already have masks. |
+| `automated_cellwise_feature_extraction.py` | For every cell in every mask: area, elongation, DAPI mean, VE-cadherin **membrane-band** mean, TAGLN whole-cell mean, centroid, and the **EndMT score** `M / (E + M)` with `E` = background-subtracted VE-cadherin, `M` = background-subtracted TAGLN, so 0 ≈ endothelial and 1 ≈ mesenchymal. |
+| `colab_cellpose.ipynb`, `lightning_colab_cellpose.ipynb` | Notebook forms of the segmentation step (Colab and Lightning). |
 
-4. **Random Masking**: 75% of patch tokens are randomly removed. Only the remaining 25% are passed to the transformer.
+Output: `cellwise_metadata/<condition>/<tile>_metadata.csv`, one row per cell.
 
-5. **Transformer Encoder**: A stack of self-attention blocks processes the visible patches. Each attention block lets every patch "look at" every other visible patch, allowing the model to reason about context.
+### Stage 2 — Master table and spatial graphs
 
-6. **Decoder**: A smaller transformer decoder takes the encoder outputs plus learnable "mask" tokens (placeholders for the missing patches) and reconstructs the full image. The loss is the MSE between predicted and actual pixel values for the masked patches only.
+`motifs/stage2_graphs/` — design in [docs/stage2_graph_construction.md](docs/stage2_graph_construction.md).
 
-### Hybrid Encoder (2D MAE)
+| File | What it does |
+|---|---|
+| `assemble_master_table.py` | Concatenates every Stage 1 CSV, adds `image_id` and `condition`, and **z-scores the five morphology/intensity features globally** across the whole dataset. `endmt_score` is kept raw so its meaning survives. Writes `master_table.csv` + `normalization_stats.json`. |
+| `build_graphs.py` | One PyTorch Geometric `Data` graph per image. Nodes carry `[5 z-scored features, endmt_score, on_border]`; edges come from **k-NN on centroids (k = 8), symmetrised by union and pruned by an adaptive per-image distance cap**; edge attributes are `[dist, dist_norm, inv_dist, is_mutual]`. Also writes a per-image QC table and overlay PNGs for eyeballing. |
 
-**File:** `models/mae.py`
+Output: `graphs/<condition>/<image_id>.pt`, `graphs/feature_names.json`,
+`graph_qc.csv`, `graph_overlays/`.
 
-Identical architecture to the focused encoder, but trained on the hybrid projection image. The two encoders have **completely independent weights** — the focused encoder specializes in one view of the tissue, the hybrid encoder specializes in the other. They share the same decoder design but not decoder weights.
+### Stage 3 — Self-supervised neighbourhood encoder
 
-### Volume Encoder (3D MAE)
+`motifs/stage3_encoder/` and `models/neighborhood_encoder.py` — design in
+[docs/stage3_gnn_encoder.md](docs/stage3_gnn_encoder.md); every architectural
+choice and the alternatives it beats are argued in
+[docs/stage3_encoder_methodology.md](docs/stage3_encoder_methodology.md).
 
-**File:** `models/mae_volume.py` — `MaskedAutoencoderVolume`
+| File | What it does |
+|---|---|
+| `sample_subgraphs.py` | Extracts a cell's **2-hop ego-subgraph** (the unit a motif is assigned to) and writes an inspection sample with preview PNGs. The same extractor runs on-the-fly during training — the ~1.27 M subgraphs are never materialised. |
+| `models/neighborhood_encoder.py` | **GATv2** encoder (3 layers, edge-feature-conditioned attention, multi-head) + mean-pool + projection head; NT-Xent loss; optional gradient-reversal **condition adversary** and an EndMT-retention head. |
+| `train_encoder.py` | Contrastive training: each subgraph gets two mild augmented views (edge drop, feature mask, outer-node drop, feature noise) that must embed close together. AdamW + cosine LR, checkpointing, optional W&B. Flags for de-confounding: `--adversarial --adv-target {condition,date,stiffness}`, `--intensity-jitter`, `--batch-norm-features`, `--endmt-head`. |
+| `embed_cells.py` | Runs the frozen encoder over every cell's real neighbourhood and writes one **64-d embedding per cell** (`embeddings.parquet`). Uses the encoder output `h`, not the projection `z`. |
+| `probe_embeddings.py` | **Confound probe**: can a classifier predict condition from the embeddings well above chance (grouped CV, MLP probe)? `--decompose` splits any leak into a **batch (imaging-date)** component vs a **biology (stiffness)** component. Also renders UMAPs coloured by condition and by EndMT score. |
 
-This encoder processes the full z-stack as a 3D volume rather than a single 2D image. The key challenge is that the z-stack is 140 slices deep — a much larger input than a single 2D image.
+Output: `stage3/encoder.pt`, `stage3/embeddings.parquet`, `stage3/probe_report.json`, UMAP PNGs.
 
-The solution is **tubelet patching** (borrowed from VideoMAE, a technique originally developed for video understanding):
+### Stage 4 — Motif clustering, validation and figures
 
-```
-Z-stack: 140 slices × 64 × 64 pixels
+`motifs/stage4_motifs/`
 
-Tubelet patching with tublet_z=4, patch_xy=16:
+| File | What it does |
+|---|---|
+| `cluster_motifs.py` | UMAP-reduce the embeddings, fit **Leiden** on a kNN graph of a subsample (k-means fallback), assign every cell to the nearest centroid. Writes `motifs.parquet`, a per-motif feature profile (what each motif *is*), motif × condition and motif × imaging-date tables — the latter is the batch-artifact check. |
+| `validate_motifs.py` | Are the motifs real? **Spatial coherence** (edge concordance vs a within-image permutation null — ratio ≈ 1 means no spatial information), **recurrence** across images, **stability** across seeds (ARI), and **separation** (silhouette). |
+| `robustness_motifs.py` | How much can each motif be trusted? Per-cell **assignment confidence** (centroid margin), **bootstrap stability** per motif, and **encoder reproducibility** (agreement between two encoders trained with different seeds). |
+| `baseline_no_neighbors.py` | Control: k-means on the same six per-cell features with **no neighbourhood information**, written in the same format so the validation and robustness scripts run unchanged. If it matches the GNN, spatial context isn't earning its keep. |
+| `plot_motif_maps.py` | Paints motif labels back onto tissue: per-image motif map beside the original tile, paired grids across conditions, per-motif EndMT breakdowns, a **motif catalog** and per-motif **galleries** of ego-subgraphs. |
+| `plot_motif_frequency.py` | The headline figure: stacked bars of motif proportion per condition ordered by stiffness, plus grouped bars with ± SEM across images. `--merge-by-stiffness` pools the two 500 kPa dates; `--labels` names the motifs. |
 
-Along Z:         140 / 4  = 35 tubes
-Along H:          64 / 16 = 4 positions
-Along W:          64 / 16 = 4 positions
-─────────────────────────────────────
-Total tokens:   35 × 4 × 4 = 560 tokens per sample
-```
+### What labels are (and are not) needed
 
-Each "tube" is a 4×16×16 voxel block. The `VolumeTubeEmbed` module extracts these tubes using a 3D convolution with kernel and stride `(4, 16, 16)`. A group of 4 consecutive z-slices corresponds to one complete focal level with all 4 fluorescence channels — so each tube has full spectral information at one spatial position in depth.
+Motif discovery is unsupervised, so almost nothing has to be hand-annotated.
 
-After tubelet extraction, the rest follows the same pattern as the 2D MAE: positional encoding, stiffness injection, masking (75%), transformer encoder, decoder, MSE loss on masked tubes.
-
-### Stiffness Conditioning
-
-**File:** `models/stiffness.py` — `StiffnessMLP`
-
-The substrate stiffness (5 or 900 kPa) is a single number per sample. This MLP converts it into a vector that matches the patch embedding dimension, which is then added to every patch token in all three encoders:
-
-```
-kPa value (e.g. 900.0)
-       │
-       ▼
-  Normalize: 900.0 / 900.0 = 1.0   (or use log1p mode)
-       │
-       ▼
-  MLP: Linear(1 → 64) → GELU → Linear(64 → 384)
-       │
-       ▼
-  stiffness_embedding: [batch, 384]
-       │
-       ▼
-  Added to ALL patch tokens in ALL three encoders
-  (broadcast over the sequence length dimension)
-```
-
-This design means the stiffness information is woven into every patch at every transformer layer via the attention mechanism. A single `StiffnessMLP` is shared across all three encoders — it learns one universal way to represent substrate stiffness.
-
-**Normalization modes** (set via `kpa_input_mode` in config):
-
-| Mode | Formula | 5 kPa → | 900 kPa → |
+| Tier | What | Needed for | How obtained |
 |---|---|---|---|
-| `divide` (default) | `kpa / 900.0` | 0.0056 | 1.0 |
-| `log1p` | `log(1 + kpa)` | 1.79 | 6.80 |
-| `identity` | raw kPa | 5.0 | 900.0 (not recommended) |
+| **1 — required** | Stiffness / condition per image | graph-level tag; adversary target | experimental metadata, already known |
+| **1 — required** | Instance segmentation mask per image | defines the graph nodes | automated (Cellpose-SAM); no biological labelling, just "where are the cells" |
+| **2 — strongly recommended** | Marker intensity per cell (VE-cadherin, TAGLN, DAPI) | node features; makes motifs interpretable by marker composition | computed from mask + image, not annotated |
+| **2 — strongly recommended** | EndMT score per cell | node feature; the biological readout | derived from marker intensities by a formula — the "labelling" work is choosing the formula/thresholds, not labelling cells |
+| **3 — validation only** | ~300–500 manually validated cell-state calls, spread across conditions | confirm the marker-based EndMT score agrees with expert review | manual review (not used in training) |
+| **3 — validation only** | ~30–50 expert-identified example neighbourhoods | sanity check that discovered motifs include patterns experts already recognise | pointed out by Prof. Huang / Carver (not used in training) |
 
-### Multi-Encoder Wrapper
+Without Tier 2 the encoder still trains and motifs still emerge, but they would
+be defined purely by morphology and arrangement, with no biological context —
+the EndMT story would be much weaker. Tier 3 is what lets us *make claims*
+about the results rather than just produce them.
 
-**File:** `models/multi_mae.py` — `MultiEncoderMAE`
+### Running the pipeline
 
-This module ties the three encoders and the stiffness MLP together into a single trainable unit:
+All commands are run from the repository root. Stage 1 needs a GPU for
+Cellpose; Stage 3 training is GPU-recommended; everything else is CPU.
 
-```python
-# Conceptually what MultiEncoderMAE.forward() does:
-
-stiff_emb = stiffness_mlp(batch["stiffness"])   # shared embedding
-
-loss_f, _, _ = mae_focused(batch["focused"], stiff_emb)
-loss_h, _, _ = mae_hybrid(batch["hybrid"],   stiff_emb)
-loss_v, _, _ = mae_volume(batch["zstack"],   stiff_emb)
-
-total_loss = w_f * loss_f + w_h * loss_h + w_v * loss_v
-```
-
-All three encoders train jointly in one backward pass. The optimizer uses **four separate parameter groups** — one for each encoder and one for the stiffness MLP — each with an independent learning rate multiplier. This allows, for example, the slower-to-converge volume encoder to use a smaller learning rate than the 2D encoders.
-
-### What is Deformable-DETR?
-
-**DETR** stands for DEtection TRansformer. Unlike traditional object detectors (like YOLO or Faster R-CNN) that use anchor boxes and region proposals, DETR frames object detection as a **direct set prediction problem**: it predicts all bounding boxes simultaneously using a set of learned "object queries."
-
-Think of it this way: DETR starts with 300 blank question-marks, each representing a potential object. Through cross-attention with the image features, each question-mark either finds an object to describe (outputting a box + class score) or stays empty (outputting "no object").
-
-**Deformable-DETR** is an improved version that is faster and handles multi-scale features better. Instead of every query attending to every pixel, it attends to a small set of key sampling points that move deformably around regions of interest. We use the HuggingFace checkpoint `SenseTime/deformable-detr` as the starting point.
-
-### Detection Fine-tuning
-
-**Files:** `training/main_detect.py`, `training/engine_detect.py`
-
-The detection model uses the focused image as input (configurable to hybrid via `detection.image_mode`). Before training:
-
-1. Images are resized so the short side is 800 pixels (preserving aspect ratio)
-2. Bounding boxes in `x1,y1,x2,y2` pixel format are converted to normalized `cx,cy,w,h` (center-x, center-y, width, height, all divided by image dimensions) as expected by DETR
-3. A boolean `pixel_mask` is added to each image indicating which pixels are real vs. padding (needed when batching images of different sizes)
-
-After each training epoch, the model is evaluated on the full training set to compute detection metrics (see Section 5).
-
-The intended future upgrade is to replace the stock ResNet-50 backbone in Deformable-DETR with the pretrained `MAEViTEncoder`. The infrastructure for this is already in place (`models/weight_loaders.py`, `detection.mae_encoder_ckpt` config key), but the ViT-to-DETR feature pyramid wiring has not yet been implemented.
-
----
-
-## 4. Training Pipeline
-
-### Stage 1: MAE Pretraining
-
-**Script:** `scripts/train_pretrain.py`
-
-**What happens each epoch:**
-
-```
-For each batch:
-  1. Load focused image, hybrid image, z-stack, stiffness kPa
-  2. Compute stiffness embedding (StiffnessMLP)
-  3. Forward pass through all three MAEs (with stiffness conditioning)
-  4. Compute weighted reconstruction losses: loss = loss_f + loss_h + loss_v
-  5. Backward pass (with optional AMP mixed precision)
-  6. Optional gradient clipping (grad_clip in config)
-  7. Optimizer step (AdamW, four param groups)
-  8. Learning rate schedule step
-
-After each epoch:
-  - Log per-head losses to outputs/pretrain_log.jsonl
-  - Log metrics to Weights & Biases (if enabled)
-  - Save checkpoint every 10% of total epochs
-```
-
-**Learning rate schedule:**
-
-```
-LR
- │         /‾‾‾‾‾‾‾‾‾‾‾\
- │        /              \
- │       /                \
- │      /                  \_____________
- │─────/
- │
- 0   warmup   peak          end
-     (10 ep)  (1.5e-4)
-```
-
-Linear warmup for `warmup_epochs` epochs, then cosine decay to `min_lr`. Each of the four parameter groups follows the same schedule shape but scaled by its `lr_mult_*` multiplier.
-
-### Stage 2: Detection Fine-tuning
-
-**Script:** `scripts/train_detect.py`
-
-Downloads the `SenseTime/deformable-detr` checkpoint from HuggingFace on first run (~160 MB). Trains with AdamW for `detection.epochs` epochs. After each epoch, runs an evaluation pass to compute mAP and related metrics.
-
-### Disk Caching
-
-Loading 140 TIFF files per well per batch is slow. The `CachedTissueChipDataset` wrapper saves each fully processed sample as a `.pt` file on the first read:
-
-- Key: `sha256(split_name + well_id)[:24]` — stable, collision-resistant
-- Location: `dataset.cache_dir` in config (set to a fast local disk or SSD)
-- Effect: First epoch is slow (reads all TIFFs, ~10 seconds per well). All subsequent epochs load in ~1 second per well — roughly a 10x speedup.
-
-Set `dataset.cache_dir` to `null` to disable caching (useful when debugging data loading).
-
-### Weights and Biases Integration
-
-All training can optionally log to [Weights & Biases](https://wandb.ai) for experiment tracking. The integration is fully optional — every W&B function is wrapped in no-ops that activate only when `wandb.enabled: true` in config.
-
-Enable it:
 ```bash
-pip install wandb
-wandb login
-# then add --wandb to the training command
+pip install -r requirements-motifs.txt
+
+# Stage 1 — on Lightning AI (or Colab via the notebooks)
+python motifs/stage1_segmentation/lightning_cellpose_batch.py
+python motifs/stage1_segmentation/automated_cellwise_feature_extraction.py
+
+# Stage 2
+python motifs/stage2_graphs/assemble_master_table.py --push-to-drive
+python motifs/stage2_graphs/build_graphs.py --k 8 --d-max-mult 3.0 --push-to-drive
+
+# Stage 3
+python motifs/stage3_encoder/sample_subgraphs.py                      # eyeball 2-hop neighbourhoods first
+python motifs/stage3_encoder/train_encoder.py --epochs 100 --batch-size 256 --seed 0
+python motifs/stage3_encoder/embed_cells.py --encoder <root>/stage3/encoder.pt
+python motifs/stage3_encoder/probe_embeddings.py --decompose            # did condition leak? batch or biology?
+
+# If the probe shows a batch leak, retrain scrubbing the imaging date:
+python motifs/stage3_encoder/train_encoder.py --epochs 100 --adversarial --adv-target date --intensity-jitter
+
+# Stage 4
+python motifs/stage4_motifs/cluster_motifs.py    --embeddings <root>/stage3/embeddings.parquet --out-dir <root>/stage4
+python motifs/stage4_motifs/validate_motifs.py   --motifs <root>/stage4/motifs.parquet --embeddings <root>/stage3/embeddings.parquet
+python motifs/stage4_motifs/robustness_motifs.py --motifs <root>/stage4/motifs.parquet --embeddings <root>/stage3/embeddings.parquet
+python motifs/stage4_motifs/baseline_no_neighbors.py --master-table <root>/master_table.csv --out-dir <root>/baseline_cells --n-clusters 6
+python motifs/stage4_motifs/plot_motif_maps.py      --motifs <root>/stage4/motifs.parquet --graphs-dir <root>/graphs --imgs-dir <root>/imgs --catalog --galleries
+python motifs/stage4_motifs/plot_motif_frequency.py --motifs <root>/stage4/motifs.parquet --merge-by-stiffness
 ```
 
-Metrics logged during pretraining:
+Every script has `--help`; each writes a JSON report and/or a log alongside its
+figures so a run is self-describing.
 
-| Metric | Description |
-|---|---|
-| `train/step_loss` | Loss every N gradient steps |
-| `train/loss` | Total epoch loss |
-| `train/loss_focused` | Focused-head reconstruction loss |
-| `train/loss_hybrid` | Hybrid-head reconstruction loss |
-| `train/loss_volume` | Volume-head reconstruction loss |
-| `lr/focused` | Learning rate for focused encoder |
-| `lr/hybrid` | Learning rate for hybrid encoder |
-| `lr/volume` | Learning rate for volume encoder |
-| `lr/stiffness` | Learning rate for StiffnessMLP |
+### Results so far
 
-Metrics logged during detection fine-tuning:
+Findings from the latest full run (internally "v4"); the run artefacts live on
+Drive / Lightning, not in git.
 
-| Metric | Description |
-|---|---|
-| `detect/step_loss` | Loss every N gradient steps |
-| `detect/loss` | Epoch detection loss |
-| `detect/lr` | Learning rate |
-| `eval/mAP` | Mean Average Precision @ IoU [0.5:0.95] |
-| `eval/AP50` | Average Precision at IoU 0.50 |
-| `eval/AP75` | Average Precision at IoU 0.75 |
-| `eval/mean_iou` | Mean best-match IoU per ground-truth box |
+- The confound probe's `--decompose` analysis showed the condition leak in the
+  embeddings was a **batch (imaging-date) effect, not a stiffness effect** —
+  which is why the adversary targets `date` and intensity jitter is used
+  rather than scrubbing stiffness (the biology we want to keep).
+- Leiden clustering yields **6 motifs** over ~1.27 M cells, silhouette ≈ 0.36.
+  Motifs are spatially coherent and recur across images.
+- **Open concern:** five of the six motifs have near-identical mean EndMT
+  (≈ 0.39); motifs currently separate on VE-cadherin intensity more than on
+  EndMT state. Candidate fixes under consideration: Delaunay / radius graphs
+  in Stage 2 instead of kNN, and stronger EndMT retention in Stage 3.
+- Next steps: interpret the motif-frequency figure across stiffness, run the
+  cross-seed encoder-reproducibility test, compare against the no-neighbour
+  baseline, and name the motifs with the lab (pick representative cells nearest
+  each centroid, report each motif's mean composition, and have a biologist
+  look at the examples).
+
+### Open questions
+
+- **Marker panel.** Three channels (VE-cadherin, TAGLN, DAPI) are enough to
+  score EndMT, but CD31, vimentin or N-cadherin would add confidence to the
+  cell-state calls and richer node features.
+- **Raw data.** The current tiles are 8-bit RGB exports (see
+  [Data](#data)); 16-bit multi-channel acquisitions would restore dynamic range
+  and remove the need for a hand-maintained channel map.
+- **Graph definition.** kNN (k = 8) is the current edge rule. Delaunay
+  triangulation or a radius graph would connect only cells that share a tissue
+  boundary and is a candidate fix for the flat-EndMT motifs above.
+- **Validation labels.** The Tier 3 manual cell-state calls and expert example
+  neighbourhoods have not yet been collected.
 
 ---
 
-## 5. Evaluation Metrics
+## 2. Track A — MAE + Deformable-DETR detection
 
-Detection quality is measured with standard object detection metrics. Here is what each one means in plain terms:
+A two-stage detector for cardiomyocytes on 5 kPa vs 900 kPa substrates
+(444 wells, each with a 35-plane × 4-channel z-stack, a focus-stacked image and
+a hybrid projection):
 
-### IoU (Intersection over Union)
+1. **Self-supervised pretraining** — three masked autoencoders (2D focused, 2D
+   hybrid, 3D tubelet-patched z-stack) trained jointly, all conditioned on
+   substrate stiffness through a shared `StiffnessMLP`.
+2. **Detection fine-tuning** — Deformable-DETR (`SenseTime/deformable-detr`)
+   on bounding-box labels, with mAP / AP50 / AP75 / mean-IoU evaluation.
 
-The most fundamental metric. For a single predicted box and a ground-truth box:
+The full write-up — data layout, architecture, configuration reference,
+metrics and commands — is in [docs/mae_detr_pipeline.md](docs/mae_detr_pipeline.md).
 
+```bash
+pip install -r requirements.txt
+python scripts/train_pretrain.py --smoke     # forward/backward on random tensors, ~10 s on CPU
+pytest tests/ -v                             # 20 synthetic-data integration tests
 ```
-         ┌──────────────┐
-         │   Ground     │
-         │   Truth      │
-         │      ┌───────┼──────┐
-         │      │  ///  │      │
-         │      │ inter-│      │
-         └──────┼───────┘      │
-                │  Prediction  │
-                └──────────────┘
 
-IoU = Area of intersection / Area of union
-```
-
-IoU = 1.0 means perfect overlap. IoU = 0 means the boxes do not touch at all. A prediction is typically considered a "hit" (true positive) if IoU > 0.5.
-
-### AP (Average Precision)
-
-For a given IoU threshold, AP summarizes the precision-recall curve into a single number. Precision measures "how often your predictions are correct"; recall measures "how many ground-truth cells you found." AP is high when the model is both precise and comprehensive.
-
-### mAP (mean Average Precision)
-
-**`eval/mAP`** — Averaged over multiple IoU thresholds from 0.5 to 0.95 in steps of 0.05. This is the standard COCO metric. A score of 1.0 means perfect detection at all strictness levels; 0.0 means no detections were correct.
-
-**`eval/AP50`** — AP at the single threshold IoU = 0.50. This is a lenient metric: a box just needs to overlap with the ground truth by more than half.
-
-**`eval/AP75`** — AP at IoU = 0.75. This is stricter — predictions must be substantially more accurate in their localization.
-
-### Mean IoU
-
-**`eval/mean_iou`** — For each ground-truth box, find the predicted box with the highest IoU and record that value. Average across all ground-truth boxes in the dataset. This gives an intuitive sense of "how well-localized the typical cell detection is."
-
-These metrics are computed using `torchmetrics.detection.MeanAveragePrecision` with the `faster_coco_eval` backend for speed.
+**Status:** the pipeline runs end-to-end and the tests pass, but the detector
+still uses the stock ResNet-50 backbone — wiring the pretrained MAE ViT into
+the DETR feature pyramid (`models/weight_loaders.py`,
+`detection.mae_encoder_ckpt`) is unfinished, and no full-dataset mAP has been
+recorded.
 
 ---
 
-## 6. Project Structure
+## 3. Repository layout
 
 ```
 Huang-Lab-Work/
+├── README.md                     ← this file
+├── requirements.txt              Track A dependencies
+├── requirements-motifs.txt       Track B dependencies
 │
-├── config/
-│   ├── __init__.py            # load_config(): deep-merges default + local YAML
-│   ├── settings.py            # Python dataclasses (FullConfig, MultiMAEConfig, etc.)
-│   ├── default.yaml           # All default hyperparameters (committed to repo)
-│   └── local.yaml             # Machine-specific data paths (gitignored)
+├── motifs/                       TRACK B — EndMT spatial-motif pipeline
+│   ├── stage1_segmentation/      Cellpose-SAM + per-cell features + EndMT score
+│   ├── stage2_graphs/            master table + kNN spatial graphs
+│   ├── stage3_encoder/           subgraph sampling, GATv2 training, embedding, confound probe
+│   └── stage4_motifs/            clustering, validation, robustness, baseline, figures
 │
-├── data/
-│   ├── modalities.py          # ZStackModalDataset, FocusedModalDataset, HybridModalDataset
-│   ├── boxes.py               # load_boxes_txt(): parse x1,y1,x2,y2 label files
-│   ├── combined.py            # TissueChipDataset: joins all modalities, filters by intersection
-│   ├── collate.py             # tissue_chip_collate(), pretrain_collate()
-│   ├── pretrain_dataset.py    # TissueChipPretrainDataset: resize/crop for MAE input
-│   ├── detection_dataset.py   # TissueChipDetectionDataset: COCO-style targets for DETR
-│   └── cache.py               # CachedTissueChipDataset: per-sample .pt disk cache
+├── models/                       Shared model code
+│   ├── neighborhood_encoder.py   Track B: GATv2 encoder, NT-Xent, adversary, EndMT head
+│   └── mae.py, mae_volume.py, multi_mae.py, stiffness.py, pos_embed.py, weight_loaders.py   (Track A)
 │
-├── models/
-│   ├── pos_embed.py           # 2D and 3D sinusoidal positional embeddings
-│   ├── stiffness.py           # StiffnessMLP: kPa scalar → embedding vector
-│   ├── mae.py                 # MaskedAutoencoderViT + MAEViTEncoder (2D)
-│   ├── mae_volume.py          # VolumeTubeEmbed + MaskedAutoencoderVolume (3D)
-│   ├── multi_mae.py           # MultiEncoderMAE: combines all three encoders
-│   └── weight_loaders.py      # Utilities to transfer MAE weights to detection backbone
+├── config/   data/   training/   scripts/   utils/   tests/     TRACK A packages
+├── notebooks/colab_train.ipynb   Track A Colab GPU training notebook
 │
-├── training/
-│   ├── lr_sched.py            # Linear warmup + cosine decay schedule
-│   ├── engine_pretrain.py     # train_one_epoch() for MAE pretraining
-│   ├── engine_detect.py       # train_one_epoch_detect() + eval_one_epoch_detect()
-│   ├── main_pretrain.py       # run_pretrain(): full loop with AdamW + checkpointing
-│   └── main_detect.py         # run_detect(): Deformable-DETR fine-tuning loop
+├── docs/
+│   ├── mae_detr_pipeline.md              Track A: full documentation
+│   ├── stage2_graph_construction.md      Track B: graph design + QC
+│   ├── stage3_gnn_encoder.md             Track B: encoder + contrastive training plan
+│   └── stage3_encoder_methodology.md     Track B: design rationale, alternatives considered
 │
-├── scripts/
-│   ├── train_pretrain.py      # CLI: --smoke | --inspect-data | --train | --wandb
-│   └── train_detect.py        # CLI: --train | --wandb | --wandb-run-name
-│
-├── utils/
-│   ├── checkpoint.py          # save_checkpoint(), load_checkpoint()
-│   ├── wandb_utils.py         # W&B wrapper (all no-ops if wandb.enabled: false)
-│   └── logging_utils.py       # General logging helpers
-│
-├── tests/
-│   └── test_pipeline.py       # 20 integration tests using synthetic data
-│
-├── colab_train.ipynb          # Google Colab notebook for GPU training
-├── requirements.txt
-├── .gitignore
-└── archive/                   # Legacy code (read-only reference)
-    ├── legacy_colab_dataloaders/   # Original Colab-based data loading scripts
-    └── legacy_facebook_mae/        # Original Meta MAE codebase (CC-BY-NC-4.0)
+└── archive/                      Read-only reference: original Colab dataloaders and the
+                                  vendored facebookresearch/mae tree (CC-BY-NC-4.0)
 ```
 
----
-
-## 7. Setup and Running
-
-### Prerequisites
-
-- Python 3.9+
-- For GPU training: CUDA 11.8 or 12.x with a compatible PyTorch wheel
-
-### Installation
+## 4. Setup
 
 ```bash
-# 1. Clone the repository
-git clone <repo-url>
+git clone https://github.com/racyun/Huang-Lab-Work.git
 cd Huang-Lab-Work
+python -m venv .venv && source .venv/bin/activate
 
-# 2. Install PyTorch for your CUDA version
-# See https://pytorch.org/get-started/locally/ for the right command.
-# Example for CUDA 12.1:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# PyTorch first, matching your CUDA version: https://pytorch.org/get-started/locally/
+pip install torch torchvision
 
-# 3. Install all other dependencies
-pip install -r requirements.txt
+pip install -r requirements-motifs.txt   # Track B
+pip install -r requirements.txt          # Track A (optional)
 ```
 
-### Quick Sanity Check (No Data Needed)
+Track B scripts read and write under `<root>` (see [Data](#data)); Track A
+takes machine-specific paths from `config/local.yaml`
+(`cp config/local.yaml.example config/local.yaml`, gitignored).
 
-```bash
-# Runs the full model forward/backward pass on random tensors.
-# Should complete in ~10 seconds on CPU.
-python scripts/train_pretrain.py --smoke
-```
+For Lightning AI, the one-time `rclone` setup for the Drive remote is
+documented at the top of `motifs/stage1_segmentation/lightning_cellpose_batch.py`.
 
-### Running the Tests
+## 5. Documentation
 
-```bash
-# All 20 integration tests, uses synthetic data, no GPU needed (~10 sec)
-pytest tests/ -v
+| Document | Covers |
+|---|---|
+| [docs/stage2_graph_construction.md](docs/stage2_graph_construction.md) | Why kNN-on-centroids, the node/edge feature contract, QC suite, gap analysis against Stage 1 |
+| [docs/stage3_gnn_encoder.md](docs/stage3_gnn_encoder.md) | Ego-subgraph sampling, GATv2 encoder, augmentations, NT-Xent, adversary, how to run |
+| [docs/stage3_encoder_methodology.md](docs/stage3_encoder_methodology.md) | Every design decision with the alternatives it beats (GNN vs MLP/CNN, GAT vs GCN, contrastive vs autoencoding, …) |
+| [docs/mae_detr_pipeline.md](docs/mae_detr_pipeline.md) | Track A end to end: data, MAE variants, stiffness conditioning, DETR fine-tuning, config reference |
 
-# Run a single test
-pytest tests/test_pipeline.py::test_multi_encoder_forward -v
-```
+## 6. Acknowledgements
 
-### Configuring Data Paths
+- **Cellpose-SAM** — Pachitariu, M., Rariden, M. & Stringer, C. (2025). Cellpose-SAM: superhuman generalization for cellular segmentation.
+- **GATv2** — Brody, S., Alon, U. & Yahav, E. (2022). How Attentive are Graph Attention Networks? (ICLR). Via PyTorch Geometric.
+- **NT-Xent / SimCLR** — Chen, T., Kornblith, S., Norouzi, M. & Hinton, G. (2020). A Simple Framework for Contrastive Learning of Visual Representations.
+- **Leiden** — Traag, V. A., Waltman, L. & van Eck, N. J. (2019). From Louvain to Leiden. Via `leidenalg` / `python-igraph`.
+- **UMAP** — McInnes, L., Healy, J. & Melville, J. (2018).
+- **MAE** — He, K. et al. (2021). Masked Autoencoders Are Scalable Vision Learners. The vendored codebase in `archive/legacy_facebook_mae/` is CC-BY-NC-4.0, Meta Platforms, Inc.
+- **VideoMAE** — Tong, Z. et al. (2022); inspiration for the 3D tubelet masking.
+- **Deformable DETR** — Zhu, X. et al. (2020); weights from the HuggingFace `SenseTime/deformable-detr` checkpoint.
+- **timm** — Wightman, R. (2019).
 
-Copy the example local config and fill in your paths:
-
-```bash
-cp config/local.yaml.example config/local.yaml
-# Edit config/local.yaml with your actual data directory paths
-```
-
-### Verifying Data Loads Correctly
-
-```bash
-python scripts/train_pretrain.py --inspect-data --local-config config/local.yaml
-```
-
-This loads and prints the shape of one real batch without running any training. Useful for catching path or format issues before a long training run.
-
-### Pretraining
-
-```bash
-# CPU (small subset, for development)
-python scripts/train_pretrain.py \
-    --config config/default.yaml \
-    --local-config config/local.yaml \
-    --train
-
-# With W&B logging
-python scripts/train_pretrain.py \
-    --config config/default.yaml \
-    --local-config config/local.yaml \
-    --train \
-    --wandb
-
-# Resume from a checkpoint
-python scripts/train_pretrain.py \
-    --config config/default.yaml \
-    --local-config config/local.yaml \
-    --train \
-    --resume outputs/multimae_epoch_50.pth
-```
-
-All scripts must be run from the **repo root**.
-
-### Detection Fine-tuning
-
-```bash
-python scripts/train_detect.py \
-    --config config/default.yaml \
-    --local-config config/local.yaml \
-    --wandb \
-    --wandb-run-name "run-001" \
-    --wandb-project "huang-lab-tissue-chip"
-```
-
-The HuggingFace `SenseTime/deformable-detr` checkpoint (~160 MB) is downloaded automatically on first run.
-
-### Google Colab (GPU Training)
-
-Open `colab_train.ipynb` in Google Colab. The notebook:
-1. Mounts Google Drive
-2. Clones this repository
-3. Writes a `local.yaml` config pointing to your Drive-hosted data
-4. Runs the full pretraining and detection pipeline with GPU
-
----
-
-## 8. Configuration
-
-The config system uses two YAML files that are deep-merged at load time:
-
-- `config/default.yaml` — committed to the repo; contains all default hyperparameters
-- `config/local.yaml` — gitignored; contains machine-specific paths and overrides
-
-Any key in `local.yaml` overrides the same key in `default.yaml`. Tilde paths (`~/path/to/data`) are expanded automatically.
-
-### Example `local.yaml`
-
-```yaml
-dataset:
-  well_count: 222
-  cache_dir: "~/.huang_lab_cache"       # set to null to disable caching
-  resize:
-    zstack: [64, 64]                    # resize z-stack frames to 64×64 (CPU default)
-    focused: [224, 224]
-    hybrid: [224, 224]
-  splits:
-    - name: "900kpa"
-      stiffness_kpa: 900.0
-      zstack_root:  "~/path/to/900kPa/zstacks"
-      focused_root: "~/path/to/900kPa/focused"
-      hybrid_root:  "~/path/to/900kPa/hybrid"
-      labels_root:  "~/path/to/900kPa/labels"
-    - name: "5kpa"
-      stiffness_kpa: 5.0
-      zstack_root:  "~/path/to/5kPa/zstacks"
-      focused_root: "~/path/to/5kPa/focused"
-      hybrid_root:  "~/path/to/5kPa/hybrid"
-      labels_root:  "~/path/to/5kPa/labels"
-
-training:
-  batch_size: 1
-  amp: false          # set to true on GPU
-
-wandb:
-  enabled: true
-  project: "huang-lab-tissue-chip"
-  entity: "your-wandb-username"
-```
-
-### Key Hyperparameters Reference
-
-**`dataset` section**
-
-| Key | Default | Description |
-|---|---|---|
-| `well_count` | 222 | Maximum well index to scan per condition |
-| `expected_z_slices` | 140 | Warns if a well has a different slice count |
-| `cache_dir` | `null` | Path for `.pt` cache files; `null` = disabled |
-| `resize` | all `null` | Optional `[H, W]` resize per modality |
-
-**`multi_mae` section**
-
-| Key | Default | Description |
-|---|---|---|
-| `image_size` | 224 | Input size for 2D MAEs (H = W) |
-| `patch_xy_2d` | 16 | Patch size in pixels for 2D MAEs |
-| `volume_z` | 140 | Number of z-slices in volume MAE |
-| `volume_h` / `volume_w` | 224 | Spatial dimensions for volume MAE |
-| `tublet_z` | 4 | Z-slices per tube (must divide `volume_z`) |
-| `embed_dim` | 384 | Patch embedding dimension |
-| `stiffness_hidden` | 64 | Hidden dimension of StiffnessMLP |
-| `kpa_input_mode` | `"divide"` | kPa normalization: `divide` / `log1p` / `identity` |
-| `mask_ratio_focused` | 0.75 | Masking ratio for focused encoder |
-| `mask_ratio_hybrid` | 0.75 | Masking ratio for hybrid encoder |
-| `mask_ratio_volume` | 0.75 | Masking ratio for volume encoder |
-| `loss_weight_focused` | 1.0 | Weight for focused head in total loss |
-| `loss_weight_hybrid` | 1.0 | Weight for hybrid head in total loss |
-| `loss_weight_volume` | 1.0 | Weight for volume head in total loss |
-| `lr_mult_focused` | 1.0 | LR multiplier for focused encoder |
-| `lr_mult_hybrid` | 1.0 | LR multiplier for hybrid encoder |
-| `lr_mult_volume` | 1.0 | LR multiplier for volume encoder |
-
-**`training` section**
-
-| Key | Default | Description |
-|---|---|---|
-| `lr` | 1.5e-4 | Base (peak) learning rate |
-| `warmup_epochs` | 10 | Number of linear warmup epochs |
-| `epochs` | 100 | Total pretraining epochs |
-| `batch_size` | 2 | Samples per batch |
-| `amp` | `true` | Mixed precision training (CUDA only) |
-| `grad_clip` | `null` | Max gradient norm; `null` = no clipping |
-
-**`detection` section**
-
-| Key | Default | Description |
-|---|---|---|
-| `hf_model` | `SenseTime/deformable-detr` | HuggingFace model ID |
-| `num_classes` | 2 | Number of classes (including background) |
-| `train_image_short_side` | 800 | Resize short side of images to this value |
-| `image_mode` | `"focused"` | Which modality to feed to DETR: `focused` or `hybrid` |
-| `mae_encoder_ckpt` | `null` | Path to multi-MAE checkpoint for backbone init (future) |
-| `epochs` | 50 | Detection fine-tuning epochs |
-
----
-
-## 9. Results So Far
-
-The pipeline infrastructure is complete and all integration tests pass. The following are the current states of each component:
-
-**Pretraining**
-- Full multi-encoder MAE forward and backward pass verified on synthetic data
-- Stiffness conditioning confirmed to produce different encoder outputs for 5 kPa vs 900 kPa inputs
-- Disk cache yields ~10x speedup on repeated epochs compared to raw TIFF loading
-- Learning rate warmup and cosine decay verified in tests
-
-**Detection**
-- Deformable-DETR fine-tuning loop runs end-to-end
-- Detection metrics (mAP, AP50, AP75, mean IoU) computed after each epoch
-- Bounding box format conversion (xyxy → normalized cxcywh) verified in tests
-
-**Not Yet Completed**
-- MAE encoder → Deformable-DETR backbone transfer: the pretrained `MAEViTEncoder` is not yet wired as the backbone in the detection model. The current detection pipeline uses the stock ResNet-50 backbone from the `SenseTime/deformable-detr` checkpoint. The weight transfer utilities exist in `models/weight_loaders.py` and the config hook (`detection.mae_encoder_ckpt`) is in place, but connecting the ViT output to the DETR feature pyramid neck is outstanding work.
-- Full-dataset training numbers are not yet available. The pipeline is ready to run on the full 444-sample dataset on GPU; final mAP scores will be recorded here after training.
-
----
-
-## 10. Acknowledgements
-
-**MAE (Masked Autoencoders Are Scalable Vision Learners)**
-He, K., Chen, X., Xie, S., Li, Y., Dollar, P., & Girshick, R. (2021).
-The original Facebook MAE codebase is archived under `archive/legacy_facebook_mae/` and is licensed CC-BY-NC-4.0 by Meta Platforms, Inc. The `models/mae.py` and `models/pos_embed.py` files in this repo are derived from that work.
-
-**VideoMAE (VideoMAE: Masked Autoencoders are Data-Efficient Learners for Self-Supervised Video Pre-Training)**
-Tong, Z., Song, Y., Wang, J., & Wang, L. (2022).
-Inspiration for the tubelet-based 3D masking strategy used in `models/mae_volume.py`.
-
-**Deformable DETR (Deformable DETR: Deformable Transformers for End-to-End Object Detection)**
-Zhu, X., Su, W., Lu, L., Li, B., Wang, X., & Dai, J. (2020).
-Detection backbone provided via the HuggingFace `SenseTime/deformable-detr` checkpoint.
-
-**timm (PyTorch Image Models)**
-Wightman, R. (2019). https://github.com/huggingface/pytorch-image-models
-Used for `PatchEmbed`, `Block`, and related ViT components.
-
-**Huang Lab, University of [Institution]**
-This pipeline was developed in collaboration with the Huang Lab for cardiovascular tissue-on-a-chip research.
+Developed in Prof. Ngan Huang's lab; channel maps and the EndMT scoring
+convention follow the lab's protocol.

@@ -21,6 +21,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Tooling
+.claude/
+
 # Project
 config/local.yaml
 outputs/
