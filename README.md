@@ -8,7 +8,7 @@ lab.
 
 Pipeline: Cellpose-SAM segmentation → per-cell features + EndMT score → one
 spatial graph per image → self-supervised GATv2 neighbourhood encoder →
-Leiden clustering into motifs → validation, robustness, and figures.
+k-means / Leiden clustering into motifs → validation, robustness, and figures.
 
 ---
 
@@ -159,7 +159,7 @@ do not fit this problem:
 ```
 Stage 1                 Stage 2                  Stage 3                    Stage 4
 ───────                 ───────                  ───────                    ───────
-tiles ─► Cellpose-SAM   per-image CSVs ─►        graphs ─► 2-hop ego        embeddings ─► UMAP + Leiden
+tiles ─► Cellpose-SAM   per-image CSVs ─►        graphs ─► 2-hop ego        embeddings ─► k-means (or Leiden)
       ─► masks               master table          subgraphs ─► GATv2         ─► motif per cell
       ─► per-cell            (global z-score)      encoder (NT-Xent,          ─► validation / robustness
          features       ─► kNN graph per image     optional adversary)        ─► motif maps, catalog,
@@ -193,10 +193,13 @@ In plain language, the six steps the code implements:
    other neighbourhoods away (NT-Xent loss). The encoder learns which properties
    survive perturbation — cell composition, spatial organisation, local
    interaction patterns — and those become the basis of similarity.
-6. **Clustering** — embed every cell, optionally UMAP-reduce 64 → ~10 dims,
-   build a kNN similarity graph over embeddings, run Leiden. Each cluster is a
-   motif; every cell gets a label; the labels feed the motif catalogue, motif
-   maps and cross-stiffness statistics.
+6. **Clustering** — embed every cell, then cluster. The headline v4 result uses
+   **k-means (k = 6) directly on the 64-d embeddings, with no UMAP step**;
+   `--method leiden` builds a kNN similarity graph and runs Leiden instead, as a
+   cross-method check. UMAP reduction (`--umap-dims`) is available but was
+   dropped: it split the continuum into artificial islands (20 motifs became
+   86). Each cluster is a motif; every cell gets a label; the labels feed the
+   motif catalogue, motif maps and cross-stiffness statistics.
 
 The one design principle carried through every stage: **features ride on
 nodes, geometry defines edges.** Nearest neighbours are computed on centroids,
@@ -281,7 +284,7 @@ Output: `stage3/encoder.pt`, `stage3/embeddings.parquet`, `stage3/probe_report.j
 
 | File | What it does |
 |---|---|
-| `cluster_motifs.py` | UMAP-reduce the embeddings, fit **Leiden** on a kNN graph of a subsample (k-means fallback), assign every cell to the nearest centroid. Writes `motifs.parquet`, a per-motif feature profile (what each motif *is*), motif × condition and motif × imaging-date tables — the latter is the batch-artifact check. |
+| `cluster_motifs.py` | Fit **k-means** (headline: k = 6, `--umap-dims 0`) or **Leiden** on a kNN graph of a subsample, optionally UMAP-reducing first, then assign every cell to the nearest centroid. Writes `motifs.parquet`, a per-motif feature profile (what each motif *is*), motif × condition and motif × imaging-date tables — the latter is the batch-artifact check. |
 | `validate_motifs.py` | Are the motifs real? **Spatial coherence** (edge concordance vs a within-image permutation null — ratio ≈ 1 means no spatial information), **recurrence** across images, **stability** across seeds (ARI), and **separation** (silhouette). |
 | `robustness_motifs.py` | How much can each motif be trusted? Per-cell **assignment confidence** (centroid margin), **bootstrap stability** per motif, and **encoder reproducibility** (agreement between two encoders trained with different seeds). |
 | `baseline_no_neighbors.py` | Control: k-means on the same six per-cell features with **no neighbourhood information**, written in the same format so the validation and robustness scripts run unchanged. If it matches the GNN, spatial context isn't earning its keep. |
@@ -350,8 +353,11 @@ Drive / Lightning, not in git.
   embeddings was a **batch (imaging-date) effect, not a stiffness effect** —
   which is why the adversary targets `date` and intensity jitter is used
   rather than scrubbing stiffness (the biology we want to keep).
-- Leiden clustering yields **6 motifs** over ~1.27 M cells, silhouette ≈ 0.36.
-  Motifs are spatially coherent and recur across images.
+- **k-means (k = 6, no UMAP)** on the v4 embeddings yields **6 motifs** over
+  ~1.27 M cells, silhouette ≈ 0.36, ARI 0.989. Motifs are spatially coherent
+  (2.17x) and recur across images. Leiden is the cross-method check and gave
+  16 / 20 / 86 motifs depending on settings, so the count is method-dependent
+  while the principal low-VE-cadherin / 5 kPa motif reappears throughout.
 - **Open concern:** five of the six motifs have near-identical mean EndMT
   (≈ 0.39); motifs currently separate on VE-cadherin intensity more than on
   EndMT state. Candidate fixes under consideration: Delaunay / radius graphs
@@ -391,7 +397,7 @@ Huang-Lab-Work/
 │   ├── stage2_graphs/            master table (global z-score) + kNN spatial graphs + QC
 │   ├── stage3_encoder/           2-hop subgraph sampling, GATv2 contrastive training,
 │   │                             per-cell embedding, confound probe
-│   └── stage4_motifs/            Leiden clustering, validation, robustness, no-neighbour
+│   └── stage4_motifs/            k-means / Leiden clustering, validation, robustness, no-neighbour
 │                                 baseline, motif maps / catalog / galleries, frequency figure
 │
 ├── models/
