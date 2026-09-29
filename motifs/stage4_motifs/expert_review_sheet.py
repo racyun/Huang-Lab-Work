@@ -179,6 +179,104 @@ def crop(tile, cx: float, cy: float, half: int):
     return rgb[y0:y1, x0:x1]
 
 
+def score_responses(responses: Path, key_path: Path) -> None:
+    """Score an expert's blind sort against the model's motif labels.
+
+    The expert's group names are arbitrary ("A"/"B", "spread"/"round", 1..6),
+    so groups are matched to motifs by maximising overlap (Hungarian) before
+    accuracy is computed. ARI is reported alongside because it needs no such
+    matching and is already chance-corrected -- the same metric used for the
+    clustering's own stability, so the two are directly comparable.
+    """
+    from scipy.optimize import linear_sum_assignment
+    from scipy.stats import binomtest
+    from sklearn.metrics import adjusted_rand_score
+
+    if responses is None or not responses.exists():
+        raise SystemExit("--mode score needs --responses <csv> with columns "
+                         "'crop' and a label column")
+    if not key_path.exists():
+        raise SystemExit(f"answer key not found: {key_path} (run --mode blind first)")
+
+    resp = pd.read_csv(responses)
+    key = pd.read_csv(key_path)
+    lab_col = next((c for c in resp.columns if c.lower() != "crop"), None)
+    if lab_col is None:
+        raise SystemExit("responses need a label column besides 'crop'")
+    df = key.merge(resp[["crop", lab_col]], on="crop", how="inner").dropna(
+        subset=[lab_col])
+    if df.empty:
+        raise SystemExit("no crop numbers matched between responses and key")
+
+    truth = df["motif"].to_numpy()
+    expert_names = df[lab_col].astype(str).str.strip().str.lower()
+    codes, uniq = pd.factorize(expert_names)
+    motifs = sorted(pd.unique(truth))
+    n = max(len(motifs), len(uniq))
+
+    C = np.zeros((n, n), dtype=np.int64)
+    m_index = {m: i for i, m in enumerate(motifs)}
+    for t, c in zip(truth, codes):
+        C[m_index[t], c] += 1
+    row, col = linear_sum_assignment(-C)
+    mapping = {c: motifs[r] for r, c in zip(row, col) if r < len(motifs)}
+    predicted = np.array([mapping.get(c, -1) for c in codes])
+
+    acc = float((predicted == truth).mean())
+    ari = float(adjusted_rand_score(truth, codes))
+
+    # Matching the expert's arbitrary group names to motifs picks the BEST of
+    # the possible assignments, which inflates accuracy on small samples (with
+    # two groups even random labels score >= 50% by construction). So the null
+    # is built by shuffling the expert's labels and re-running the same
+    # matching, rather than by assuming a fixed chance level.
+    rng = np.random.default_rng(0)
+    null = np.empty(2000)
+    for i in range(null.size):
+        sh = rng.permutation(codes)
+        Cn = np.zeros((n, n), dtype=np.int64)
+        for t, c in zip(truth, sh):
+            Cn[m_index[t], c] += 1
+        rr, cc = linear_sum_assignment(-Cn)
+        mp = {c: motifs[r] for r, c in zip(rr, cc) if r < len(motifs)}
+        null[i] = (np.array([mp.get(c, -1) for c in sh]) == truth).mean()
+    chance = float(null.mean())
+    p = float((null >= acc).mean())
+    p_naive = binomtest(int((predicted == truth).sum()), len(truth),
+                        max(1.0 / len(motifs), 1e-9), alternative="greater").pvalue
+
+    print(f"\nBLIND SORT — expert vs model  ({len(df)} crops scored)")
+    print(f"  expert used {len(uniq)} group(s): {list(uniq)}")
+    print(f"  model has   {len(motifs)} motif(s) in these crops: {motifs}")
+    print(f"\n  agreement (after optimal group matching) : {100 * acc:.1f}%")
+    print(f"  chance under label permutation           : {100 * chance:.1f}%"
+          f"   (not 1/k — matching inflates it)")
+    print(f"  permutation p                            : {p:.4g}"
+          f"{'  (< 1/2000 resolution)' if p == 0 else ''}")
+    print(f"  adjusted Rand index                      : {ari:.3f}")
+    if len(df) < 40:
+        print(f"  [caution] only {len(df)} crops — the matching step biases small "
+              f"samples upward; 40+ makes this much more reliable")
+    print("\n  per-motif recall (share of that motif's crops the expert "
+          "put in the matching group):")
+    for m in motifs:
+        sel = truth == m
+        if sel.any():
+            print(f"    motif {m:>2}: {100 * (predicted[sel] == m).mean():5.1f}%  "
+                  f"({int(sel.sum())} crops)")
+    print()
+    if ari >= 0.4 and p < 0.05:
+        print("  => The expert's grouping agrees with the model well above chance:")
+        print("     the motifs correspond to distinctions a biologist also makes.")
+    elif p < 0.05:
+        print("  => Better than chance but weak agreement: the motifs capture")
+        print("     something real, but not the primary distinction the expert sees.")
+    else:
+        print("  => No detectable agreement. Either the motifs do not correspond")
+        print("     to visible biology, or the crops are too subtle to sort by eye.")
+        print("     Both are honest, reportable outcomes.")
+
+
 def _grid(items, ncol, cell_in=2.6):
     nrow = max(1, int(np.ceil(len(items) / ncol)))
     fig, axes = plt.subplots(nrow, ncol,
@@ -199,8 +297,18 @@ def main() -> None:
     ap.add_argument("--norm-stats", type=Path,
                     default=root / "normalization_stats.json")
     ap.add_argument("--out-dir", type=Path, default=None)
-    ap.add_argument("--mode", choices=["catalog", "contrast", "blind", "table"],
+    ap.add_argument("--mode",
+                    choices=["catalog", "contrast", "blind", "table", "score"],
                     default="catalog")
+    ap.add_argument("--blind-pair", default=None,
+                    help="restrict the blind sheet to two motifs, e.g. '2,3', "
+                         "balanced between them. A two-way sort is far faster to "
+                         "do and gives clean 50%%-chance statistics; the all-motif "
+                         "sheet is the harder, more open-ended version.")
+    ap.add_argument("--responses", type=Path, default=None,
+                    help="--mode score: CSV of the expert's answers with a 'crop' "
+                         "column and a label column (any names: A/B, 'spread'/"
+                         "'round', 1..6). Scored against blind_answer_key.csv.")
     ap.add_argument("--pick", choices=["typical", "extreme"], default="extreme")
     ap.add_argument("--per-motif", type=int, default=12)
     ap.add_argument("--crop-size", type=int, default=160,
@@ -217,6 +325,10 @@ def main() -> None:
 
     out_dir = (args.out_dir or args.motifs.parent) / "expert_review"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "score":
+        score_responses(args.responses, out_dir / "blind_answer_key.csv")
+        return
 
     mdf = pd.read_parquet(args.motifs)
     master = pd.read_csv(args.master_table)
@@ -322,7 +434,14 @@ def main() -> None:
     # ---- 3c. blind: shuffled, numbered, with a separate answer key ----
     if args.mode == "blind":
         rng = np.random.default_rng(args.seed)
-        pool = [(m, *c) for m in range(n_motifs) for c in crops[m]]
+        if args.blind_pair:
+            a, b = (int(x) for x in args.blind_pair.split(","))
+            k = min(len(crops[a]), len(crops[b]))       # balanced, so chance = 50%
+            pool = ([(a, *c) for c in crops[a][:k]] +
+                    [(b, *c) for c in crops[b][:k]])
+            print(f"  two-way sheet: motif {a} vs motif {b}, {k} crops each")
+        else:
+            pool = [(m, *c) for m in range(n_motifs) for c in crops[m]]
         rng.shuffle(pool)
         per_page = 20
         key_rows = []
