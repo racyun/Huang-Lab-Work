@@ -36,8 +36,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-VERSION = "2026-07-28 four-panel + catalog + ego-subgraph galleries"
+VERSION = "2026-09-28 four-panel + catalog + galleries (R/B channel fix)"
 IMG_EXTS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
+
+# Plane index of each marker in the focus-stacked tiles. These MUST match the
+# constants stage 1 extracts features through (TAGLN_IDX/VECAD_IDX/DAPI_IDX in
+# automated_cellwise_feature_extraction.py): the tiles are in RGB-plane order,
+# which is the reverse of the CH1/CH2/CH3 numbering.
+TAGLN_PLANE = 0   # CH3, red
+VECAD_PLANE = 1   # CH2, green
+DAPI_PLANE = 2    # CH1, blue
 
 
 def _default_local_root() -> Path:
@@ -60,14 +68,23 @@ def _stretch(ch):
 
 
 def _composite(im):
-    """R=TAGLN(ch3), G=VE-cad(ch2), B=DAPI(ch1)."""
+    """Percentile-stretched RGB view: R=TAGLN(ch3), G=VE-cad(ch2), B=DAPI(ch1).
+
+    The tiles are already stored in RGB-plane order with the markers in their
+    display planes (plane 0 = TAGLN/red, 1 = VE-cad/green, 2 = DAPI/blue), the
+    same convention stage 1 reads features through (TAGLN_IDX=0, VECAD_IDX=1,
+    DAPI_IDX=2). So planes map straight through and only the contrast stretch
+    is applied. This previously reversed R and B, which rendered DAPI red and
+    TAGLN blue while the docstring claimed otherwise; figures made before that
+    fix have those two channels swapped.
+    """
     if im.ndim == 2:
         s = _stretch(im)
         return np.dstack([s, s, s])
     rgb = np.zeros((*im.shape[:2], 3), dtype=float)
-    rgb[..., 0] = _stretch(im[..., 2])
-    rgb[..., 1] = _stretch(im[..., 1])
-    rgb[..., 2] = _stretch(im[..., 0])
+    rgb[..., 0] = _stretch(im[..., TAGLN_PLANE])   # red   <- CH3 TAGLN
+    rgb[..., 1] = _stretch(im[..., VECAD_PLANE])   # green <- CH2 VE-cadherin
+    rgb[..., 2] = _stretch(im[..., DAPI_PLANE])    # blue  <- CH1 DAPI
     return rgb
 
 
