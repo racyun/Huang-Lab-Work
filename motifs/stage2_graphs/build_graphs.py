@@ -21,6 +21,7 @@ Outputs (doc §8):
 Usage:
     python build_graphs.py                 # defaults, k=8
     python build_graphs.py --k 8 --d-max-mult 3.0 --overlays-per-condition 5
+    python build_graphs.py --edge-rule delaunay --out-dir <root>/delaunay
 """
 
 from __future__ import annotations
@@ -47,7 +48,11 @@ except ImportError as e:  # pragma: no cover
         f"(import error: {e})"
     )
 
-from scipy.spatial import cKDTree
+from scipy.spatial import Delaunay, cKDTree
+try:
+    from scipy.spatial import QhullError
+except ImportError:  # older scipy keeps it private
+    from scipy.spatial.qhull import QhullError
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
@@ -75,8 +80,17 @@ def _default_local_root() -> Path:
 
 
 def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float,
-                image_w: float | None = None, image_h: float | None = None):
+                image_w: float | None = None, image_h: float | None = None,
+                edge_rule: str = "knn", radius_mult: float = 1.5):
     """Build one PyG Data from a single image's rows. Returns (data, qc_dict).
+
+    edge_rule picks the candidate edges before the d_max prune:
+      knn       union of each cell's k nearest centroids (the v1-v4 default)
+      delaunay  Delaunay triangulation of the centroids: joins cells that share
+                a Voronoi boundary, so no edge skips over an intervening cell
+      radius    every pair closer than radius_mult x the image's median NN dist
+    All three share d_max, edge_attr and is_mutual (still k-NN mutuality), so
+    the encoder sees the same input format whichever rule built the graph.
 
     df_image must contain centroid_x/centroid_y, the ZSCORE_COLS, endmt_score,
     image_id and condition.
@@ -109,7 +123,8 @@ def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float,
             qc["status"] = "reduced_k"
 
     # ----- k-NN on centroids (cKDTree); also record directed neighbor sets so
-    #       is_mutual can be computed BEFORE the union (doc §4 caveat) -----
+    #       is_mutual can be computed BEFORE the union (doc §4 caveat). k-NN
+    #       runs for every edge rule: it sets d_max and the is_mutual flag -----
     edges: dict[tuple[int, int], bool] = {}   # (i<j) -> is_mutual
     d_max = float("nan")
     if kq >= 1:
@@ -124,14 +139,36 @@ def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float,
         qc["d_max"] = d_max
 
         nbr_sets = [set(idx_knn[i, 1:]) for i in range(n)]
-        for i in range(n):
-            for j in nbr_sets[i]:
-                a, b = (i, int(j)) if i < j else (int(j), i)
-                if a == b:
-                    continue
-                mutual = (j in nbr_sets[i]) and (i in nbr_sets[int(j)])
-                # OR over directions: an edge stays mutual if either pass flags it
-                edges[(a, b)] = edges.get((a, b), False) or mutual
+
+        def is_mutual(a: int, b: int) -> bool:
+            return (b in nbr_sets[a]) and (a in nbr_sets[b])
+
+        rule = edge_rule
+        if rule == "delaunay" and n < 4:
+            rule = "knn"                     # Delaunay needs >= 3 non-collinear points
+            qc["status"] = "delaunay_fell_back_to_knn"
+        if rule == "delaunay":
+            try:
+                tri = Delaunay(pos_np)
+            except QhullError:               # e.g. all centroids collinear
+                rule = "knn"
+                qc["status"] = "delaunay_fell_back_to_knn"
+            else:
+                for simplex in tri.simplices:
+                    for u, v in ((0, 1), (1, 2), (0, 2)):
+                        a, b = sorted((int(simplex[u]), int(simplex[v])))
+                        edges[(a, b)] = is_mutual(a, b)
+        if rule == "radius":
+            for a, b in tree.query_pairs(radius_mult * median_nn):
+                edges[(a, b)] = is_mutual(a, b)
+        if rule == "knn":
+            for i in range(n):
+                for j in nbr_sets[i]:
+                    a, b = (i, int(j)) if i < j else (int(j), i)
+                    if a == b:
+                        continue
+                    # OR over directions: an edge stays mutual if either pass flags it
+                    edges[(a, b)] = edges.get((a, b), False) or is_mutual(i, int(j))
 
     # ----- distance prune + assemble undirected edge list -----
     src, dst, e_dist, e_mutual = [], [], [], []
@@ -239,7 +276,17 @@ def main() -> None:
     ap.add_argument("--master-table", type=Path, default=root / "master_table.csv")
     ap.add_argument("--out-dir", type=Path, default=root,
                     help="root for graphs/, graph_qc.csv, graph_overlays/")
-    ap.add_argument("--k", type=int, default=8, help="k for k-NN (default: 8)")
+    ap.add_argument("--k", type=int, default=8,
+                    help="k for k-NN (default: 8). Also sets d_max and is_mutual "
+                         "under the other edge rules")
+    ap.add_argument("--edge-rule", choices=["knn", "delaunay", "radius"],
+                    default="knn",
+                    help="how candidate edges are chosen (default: knn). Use a "
+                         "fresh --out-dir for non-knn rules so the kNN graphs "
+                         "are not overwritten")
+    ap.add_argument("--radius-mult", type=float, default=1.5,
+                    help="radius rule: connect pairs within this x median NN "
+                         "distance (default: 1.5)")
     ap.add_argument("--d-max-mult", type=float, default=3.0,
                     help="d_max = mult x median NN distance per image (default: 3.0)")
     ap.add_argument("--image-size", type=int, default=682,
@@ -276,7 +323,9 @@ def main() -> None:
     # group by image; keep condition order stable
     for (condition, image_id), df_img in master.groupby(["condition", "image_id"], sort=True):
         data, qc = build_graph(df_img, k=args.k, d_max_mult=args.d_max_mult,
-                               image_w=img_dim, image_h=img_dim)
+                               image_w=img_dim, image_h=img_dim,
+                               edge_rule=args.edge_rule, radius_mult=args.radius_mult)
+        qc["edge_rule"] = args.edge_rule
         cond_dir = graphs_dir / condition
         cond_dir.mkdir(parents=True, exist_ok=True)
         torch.save(data, cond_dir / f"{image_id}.pt")
