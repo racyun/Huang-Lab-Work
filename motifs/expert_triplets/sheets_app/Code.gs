@@ -17,7 +17,7 @@
  * Setup and deployment steps are in README.md next to this file.
  */
 
-const APP_VERSION = 'triplets-sheets-v2';
+const APP_VERSION = 'triplets-sheets-v4';
 const INSTRUCTIONS_VERSION = 'v2';
 // How triplets are drawn (same defaults as the design notes):
 const TEST_FIRST = 150;    // answered test triplets per annotator before mixing
@@ -223,6 +223,9 @@ function shuffle_(a) {
   return a;
 }
 
+/** The page's copy of a set: crop order on screen plus the images, read from
+ *  Drive. Always called OUTSIDE the lock: reading images is the slow part, and
+ *  it must not hold up other requests. */
 function payload_(t, crops, order) {
   const byId = {};
   crops.forEach(c => { byId[c.crop_id] = c; });
@@ -284,87 +287,137 @@ function apiConfig(token) {
            instructions_version: INSTRUCTIONS_VERSION };
 }
 
-function apiNext(token, who) {
+/** Everything one request needs from the Sheet, read once. The helpers below
+ *  update it in place, so later steps in the same request see earlier ones. */
+function state_() {
+  return { crops: readTable_('crops'), triplets: readTable_('triplets'), live: liveAnswers_() };
+}
+
+function progress_(who, live) {
+  const mine = live.filter(a => a.annotator === who);
+  const today = new Date().toISOString().slice(0, 10);
+  return { total: mine.length, today: mine.filter(a => a.answered_at >= today).length };
+}
+
+/** Choose the next set for `who` (call inside the lock). Sets already handed
+ *  out but unanswered come first; otherwise a new one is created. `skip` holds
+ *  the sets the page already has. Returns the triplet row, or null if none. */
+function nextTriplet_(who, skip, st, nAnnotators) {
+  const mine = new Set(st.live.filter(a => a.annotator === who).map(a => a.triplet_id));
+  const pending = st.triplets
+    .filter(t => (t.created_for === who || (t.shared === '1' && t.created_for !== who)) &&
+                 !mine.has(t.triplet_id) && !skip.has(t.triplet_id))
+    .sort((a, b) => (b.created_for === who) - (a.created_for === who) ||
+                    (a.created_at < b.created_at ? -1 : 1));
+  if (pending.length) return pending[0];
+
+  const split0 = {};
+  st.triplets.forEach(t => { split0[t.triplet_id] = t.split; });
+  const nTest = st.live.filter(a => a.annotator === who && split0[a.triplet_id] === 'test').length;
+  let split = nTest < TEST_FIRST ? 'test' : (Math.random() < TEST_SHARE ? 'test' : 'train');
+  const flagged = flaggedCrops_(st.live);
+  let chosen = pick_(split, st.crops, st.triplets, flagged);
+  if (!chosen && split === 'test') { split = 'train'; chosen = pick_('train', st.crops, st.triplets, flagged); }
+  if (!chosen) return null;
+  const shared = split === 'test' && nAnnotators > 1 && Math.random() < 1 / SHARED_EVERY;
+  const t = { triplet_id: Utilities.getUuid().replace(/-/g, '').slice(0, 12),
+              created_at: now_(), created_for: who, split: split,
+              shared: shared ? '1' : '0',
+              crop_1: chosen[0], crop_2: chosen[1], crop_3: chosen[2] };
+  appendRows_(sheet_('triplets'), [HEADERS.triplets.map(h => t[h])]);
+  st.triplets.push(t);
+  return t;
+}
+
+/** Validate and append one answer (call inside the lock). */
+function saveAnswer_(who, body, st) {
+  const t = st.triplets.find(x => x.triplet_id === body.triplet_id);
+  if (!t) return { error: 'unknown triplet' };
+  const ids = [t.crop_1, t.crop_2, t.crop_3];
+  const order = body.order || [];
+  if (order.length !== 3 || order.slice().sort().join() !== ids.slice().sort().join())
+    return { error: 'order does not match the triplet' };
+  if (POSITIONS.concat(['unusable']).indexOf(body.choice) < 0) return { error: 'bad choice' };
+  const unusable = Array.from(new Set(body.unusable || []));
+  if (unusable.some(c => ids.indexOf(c) < 0)) return { error: 'flagged crop is not in this set' };
+  if ((body.choice === 'unusable') !== (unusable.length > 0))
+    return { error: 'unusable needs at least one flagged image, and a pick needs none' };
+  if (t.created_for !== who && t.shared !== '1')
+    return { error: 'triplet belongs to another annotator' };
+  if (st.live.some(a => a.annotator === who && a.triplet_id === t.triplet_id))
+    return { ok: true, duplicate: true };                       // resent or double-click
+  const sh = sheet_('annotations');
+  const id = String(sh.getLastRow());             // header is row 1, ids 1, 2, ...
+  const odd = body.choice === 'unusable' ? '' : order[POSITIONS.indexOf(body.choice)];
+  const row = { annotation_id: id, triplet_id: t.triplet_id, annotator: who,
+                shown_left: order[0], shown_middle: order[1], shown_right: order[2],
+                choice: body.choice, odd_crop: odd,
+                response_ms: String(Math.round(Number(body.response_ms) || 0) || ''),
+                shown_at: String(body.shown_at || ''), answered_at: now_(),
+                app_version: APP_VERSION, instructions_version: INSTRUCTIONS_VERSION,
+                render_version: prop_('RENDER_VERSION') || '',
+                unusable_crops: unusable.join(';') };
+  appendRows_(sh, [HEADERS.annotations.map(h => row[h])]);
+  st.live.push(row);
+  return { ok: true, annotation_id: id };
+}
+
+/** One round trip per step: save any answers the page is holding, then hand
+ *  back up to `want` (max 3) more sets. Answers are deduplicated, so the page
+ *  can safely resend after a failed request. Images are read after the lock
+ *  is released. */
+function apiSync(token, who, answers, exclude, want) {
   who = checked_(token, who);
-  return withLock_(() => {
-    const crops = readTable_('crops');
-    const triplets = readTable_('triplets');
-    const live = liveAnswers_();
-    const mine = new Set(live.filter(a => a.annotator === who).map(a => a.triplet_id));
-
-    // 1. anything already handed to this annotator but unanswered
-    const pending = triplets
-      .filter(t => (t.created_for === who || (t.shared === '1' && t.created_for !== who)) &&
-                   !mine.has(t.triplet_id))
-      .sort((a, b) => (b.created_for === who) - (a.created_for === who) ||
-                      (a.created_at < b.created_at ? -1 : 1));
-    if (pending.length) return payload_(pending[0], crops);
-
-    // 2. a new triplet
-    const split0 = {};
-    triplets.forEach(t => { split0[t.triplet_id] = t.split; });
-    const nTest = live.filter(a => a.annotator === who && split0[a.triplet_id] === 'test').length;
-    let split = nTest < TEST_FIRST ? 'test' : (Math.random() < TEST_SHARE ? 'test' : 'train');
-    const flagged = flaggedCrops_(live);
-    let chosen = pick_(split, crops, triplets, flagged);
-    if (!chosen && split === 'test') { split = 'train'; chosen = pick_('train', crops, triplets, flagged); }
-    if (!chosen) return { empty: true };
-    const nAnnotators = apiConfig(token).annotators.length;
-    const shared = split === 'test' && nAnnotators > 1 && Math.random() < 1 / SHARED_EVERY;
-    const t = { triplet_id: Utilities.getUuid().replace(/-/g, '').slice(0, 12),
-                created_at: now_(), created_for: who, split: split,
-                shared: shared ? '1' : '0',
-                crop_1: chosen[0], crop_2: chosen[1], crop_3: chosen[2] };
-    appendRows_(sheet_('triplets'), [HEADERS.triplets.map(h => t[h])]);
-    return payload_(t, crops);
+  const nAnnotators = apiConfig(token).annotators.length;
+  const r = withLock_(() => {
+    const st = state_();
+    const saved = [], failed = [];
+    (answers || []).forEach(body => {
+      const res = saveAnswer_(who, body, st);
+      if (res.error) failed.push({ triplet_id: body.triplet_id, error: res.error });
+      else saved.push(body.triplet_id);
+    });
+    const skip = new Set(exclude || []), picks = [];
+    let empty = false;
+    for (let i = 0; i < Math.min(Number(want) || 0, 3); i++) {
+      const t = nextTriplet_(who, skip, st, nAnnotators);
+      if (!t) { empty = true; break; }
+      skip.add(t.triplet_id);
+      picks.push(t);
+    }
+    return { saved, failed, empty, picks, crops: st.crops, progress: progress_(who, st.live) };
   });
+  return { saved: r.saved, failed: r.failed, empty: r.empty, progress: r.progress,
+           sets: r.picks.map(t => payload_(t, r.crops)) };
+}
+
+/** Single-set and single-answer forms of apiSync. */
+function apiNext(token, who, exclude) {
+  const r = apiSync(token, who, [], exclude, 1);
+  return r.sets[0] || { empty: true };
 }
 
 function apiAnswer(token, body) {
   const who = checked_(token, body && body.annotator);
   return withLock_(() => {
-    const t = readTable_('triplets').find(x => x.triplet_id === body.triplet_id);
-    if (!t) return { error: 'unknown triplet' };
-    const ids = [t.crop_1, t.crop_2, t.crop_3];
-    const order = body.order || [];
-    if (order.length !== 3 || order.slice().sort().join() !== ids.slice().sort().join())
-      return { error: 'order does not match the triplet' };
-    if (POSITIONS.concat(['unusable']).indexOf(body.choice) < 0) return { error: 'bad choice' };
-    const unusable = Array.from(new Set(body.unusable || []));
-    if (unusable.some(c => ids.indexOf(c) < 0)) return { error: 'flagged crop is not in this set' };
-    if ((body.choice === 'unusable') !== (unusable.length > 0))
-      return { error: 'unusable needs at least one flagged image, and a pick needs none' };
-    if (t.created_for !== who && t.shared !== '1')
-      return { error: 'triplet belongs to another annotator' };
-    if (liveAnswers_().some(a => a.annotator === who && a.triplet_id === t.triplet_id))
-      return { ok: true, duplicate: true };                     // double-click
-    const sh = sheet_('annotations');
-    const id = String(sh.getLastRow());           // header is row 1, ids 1, 2, ...
-    const odd = body.choice === 'unusable' ? '' : order[POSITIONS.indexOf(body.choice)];
-    const row = { annotation_id: id, triplet_id: t.triplet_id, annotator: who,
-                  shown_left: order[0], shown_middle: order[1], shown_right: order[2],
-                  choice: body.choice, odd_crop: odd,
-                  response_ms: String(Math.round(Number(body.response_ms) || 0) || ''),
-                  shown_at: String(body.shown_at || ''), answered_at: now_(),
-                  app_version: APP_VERSION, instructions_version: INSTRUCTIONS_VERSION,
-                  render_version: prop_('RENDER_VERSION') || '',
-                  unusable_crops: unusable.join(';') };
-    appendRows_(sh, [HEADERS.annotations.map(h => row[h])]);
-    return { ok: true, annotation_id: id };
+    const st = state_();
+    const res = saveAnswer_(who, body, st);
+    return res.error ? res : Object.assign(res, { progress: progress_(who, st.live) });
   });
 }
 
 function apiUndo(token, who) {
   who = checked_(token, who);
-  return withLock_(() => {
+  const r = withLock_(() => {
     const mine = liveAnswers_().filter(a => a.annotator === who);
     if (!mine.length) return { error: 'nothing to undo' };
     const last = mine.reduce((a, b) => (Number(b.annotation_id) > Number(a.annotation_id) ? b : a));
     appendRows_(sheet_('retractions'), [[last.annotation_id, now_()]]);
-    const t = readTable_('triplets').find(x => x.triplet_id === last.triplet_id);
-    return payload_(t, readTable_('crops'),
-                    [last.shown_left, last.shown_middle, last.shown_right]);
+    return { last: last, t: readTable_('triplets').find(x => x.triplet_id === last.triplet_id),
+             crops: readTable_('crops') };
   });
+  if (r.error) return r;
+  return payload_(r.t, r.crops, [r.last.shown_left, r.last.shown_middle, r.last.shown_right]);
 }
 
 function apiProgress(token, who) {
