@@ -188,8 +188,13 @@ def main() -> None:
                     help="share of images per condition in test (first run only)")
     ap.add_argument("--k", type=int, default=8, help="k-NN k, as in stage 2")
     ap.add_argument("--crop-size", type=int, default=0,
-                    help="crop width in px; 0 = auto from the 90th percentile "
+                    help="crop width in px; 0 = auto from --crop-percentile "
                          "of 2-hop footprints (first run only, then frozen)")
+    ap.add_argument("--crop-percentile", type=float, default=50,
+                    help="auto crop size covers this percentile of 2-hop "
+                         "footprint widths: 50 = the typical neighbourhood "
+                         "fits; 90 = almost all fit, but most crops then show "
+                         "far more tissue than the model sees (first run only)")
     ap.add_argument("--contrast", choices=["tile", "global"], default="tile",
                     help="tile = stretch each image on its own percentiles (as "
                          "in the other expert sheets); global = one stretch for "
@@ -238,10 +243,12 @@ def main() -> None:
             pick = rng.choice(len(pos), size=min(50, len(pos)), replace=False)
             sizes += [2 * footprint_extent(pos, fp[i], i) for i in pick]
             nn.append(np.median(cKDTree(pos).query(pos, k=2)[0][:, 1]))
-        size = args.crop_size or int(np.ceil(np.percentile(sizes, 90) * 1.1 / 2) * 2)
+        size = args.crop_size or int(np.ceil(
+            np.percentile(sizes, args.crop_percentile) * 1.1 / 2) * 2)
         cfg = {"crop_size": size, "contrast": args.contrast, "k": args.k,
                "marker_radius": round(float(np.median(nn)) * 0.7, 1),
                "mark_neighbors": bool(args.mark_neighbors),
+               "crop_percentile": args.crop_percentile,
                "image_format": args.image_format,
                "render_version": f"2hop-k{args.k}-{size}px-{args.contrast}"
                                  f"{'-nbr' if args.mark_neighbors else ''}"
