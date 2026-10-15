@@ -182,15 +182,15 @@
   }
   $("other").onsubmit = (e) => { e.preventDefault(); const n = $("otherName").value.trim(); if (n) begin(n); };
   $("switch").onclick = () => {
-    if (outbox.length || inflight) { toast("Still saving your last answers. Try again in a moment.", true); return; }
-    store.del("annotator"); who = null; epoch++; queue = []; current = null; showStart();
+    if (unsettled() || inflight) { toast("Still saving your last answers. Try again in a moment.", true); return; }
+    store.del("annotator"); who = null; epoch++; queue = []; history = []; current = null; showStart();
   };
 
   function begin(name) {
     who = name; store.set("annotator", name);
     $("whoName").textContent = name;
     $("start").classList.add("hidden"); $("app").classList.remove("hidden");
-    epoch++; queue = []; inflight = false; noMore = false; current = null;
+    epoch++; queue = []; history = []; inflight = false; noMore = false; current = null;
     call("apiProgress", who).then(showProgress).catch(() => {});
     showNext();
   }
@@ -203,6 +203,10 @@
   const AHEAD = 2;
   let queue = [], outbox = [], inflight = false, noMore = false, waiting = false, epoch = 0;
   let lastProgress = null;
+  let history = [];                        // sets answered, newest last (for undo)
+  let undos = [];                          // triplet ids whose saved answer must be undone
+  let sentNow = new Set();                 // triplet ids in the request in flight
+  const unsettled = () => outbox.length + undos.length;
 
   const held = () => [current && current.triplet_id, ...queue.map((t) => t.triplet_id),
                       ...outbox.map((a) => a.triplet_id)].filter(Boolean);
@@ -210,14 +214,16 @@
   function sync() {
     if (inflight || !who) return;
     const want = noMore ? 0 : Math.max(0, AHEAD - queue.length);
-    if (!want && !outbox.length) return;
+    if (!want && !unsettled()) return;
     inflight = true;
-    const my = epoch, sending = outbox.slice();
-    call("apiSync", who, sending, held(), want).then((r) => {
+    const my = epoch, sending = outbox.slice(), undoing = undos.slice();
+    sentNow = new Set(sending.map((a) => a.triplet_id));
+    call("apiSync", who, sending, held(), want, undoing).then((r) => {
       if (my !== epoch) return;
-      inflight = false;
+      inflight = false; sentNow = new Set();
       const done = new Set([...r.saved, ...r.failed.map((f) => f.triplet_id)]);
-      outbox = outbox.filter((a) => !done.has(a.triplet_id));
+      outbox = outbox.filter((a) => !(done.has(a.triplet_id) && sending.includes(a)));
+      undos = undos.filter((tid) => !r.retracted.includes(tid));
       if (r.failed.length) toast("An answer couldn't be saved (" + r.failed[0].error + "). That set will come back to you.", true);
       if (r.empty) noMore = true;
       r.sets.forEach((t) => { t.images.forEach((src) => { new Image().src = src; }); queue.push(t); });
@@ -226,8 +232,8 @@
       sync();
     }).catch((e) => {
       if (my !== epoch) return;
-      inflight = false;
-      if (waiting || outbox.length) toast("Connection trouble (" + e.message + "). Retrying… your answers are kept.", true);
+      inflight = false; sentNow = new Set();
+      if (waiting || unsettled()) toast("Connection trouble (" + e.message + "). Retrying… your answers are kept.", true);
       setTimeout(sync, 2500);
     });
   }
@@ -251,9 +257,9 @@
   function showProgress(p) {
     if (p && typeof p.total === "number") lastProgress = p;
     const base = lastProgress ? "<b>" + lastProgress.total + "</b> answered · " + lastProgress.today + " today" : "";
-    $("progress").innerHTML = base + (outbox.length ? ' <span class="saving">· saving…</span>' : "");
+    $("progress").innerHTML = base + (unsettled() ? ' <span class="saving">· saving…</span>' : "");
   }
-  window.addEventListener("beforeunload", (e) => { if (outbox.length) { e.preventDefault(); e.returnValue = ""; } });
+  window.addEventListener("beforeunload", (e) => { if (unsettled()) { e.preventDefault(); e.returnValue = ""; } });
 
   // ---------- triplets ----------
   function render(t) {
@@ -311,29 +317,35 @@
       return;
     }
     const unusable = [...flagged].sort().map((i) => current.order[i]);
+    history.push(current); if (history.length > 20) history.shift();
     outbox.push({ annotator: who, triplet_id: current.triplet_id, order: current.order, choice, unusable,
                   response_ms: Math.round(performance.now() - readyAt), shown_at: shownAt });
     toast(""); showProgress();
     showNext();                                  // instant if a set is loaded ahead
   }
 
-  async function undo() {
+  // Undo shows the previous set at once from memory. If its answer never left
+  // the page it is simply dropped; otherwise the server is told in the
+  // background (before any new answer to that set) to remove it.
+  function undo() {
     if (busy) return;
-    busy = true;
-    toast("Undoing…");
-    try {
-      while (outbox.length || inflight) {        // the answer to undo must be saved first
-        sync(); await new Promise((r) => setTimeout(r, 200));
-      }
-      const t = await call("apiUndo", who);
-      if (current) queue.unshift(current);       // keep the set that was on screen
-      $("triplet").classList.remove("hidden"); $("empty").classList.add("hidden");
-      waiting = false; render(t);
-      if (lastProgress) { lastProgress.total = Math.max(0, lastProgress.total - 1); lastProgress.today = Math.max(0, lastProgress.today - 1); }
-      showProgress();
-      toast("Previous set restored. Your earlier answer was withdrawn.");
-    } catch (e) { toast(e.message === "nothing to undo" ? "Nothing to undo." : "Undo failed: " + e.message, true); }
-    busy = false;
+    const prev = history.pop();
+    if (!prev) { toast("Nothing to undo."); return; }
+    const i = outbox.findIndex((a) => a.triplet_id === prev.triplet_id);
+    const reachedServer = i < 0 || sentNow.has(prev.triplet_id);
+    if (i >= 0) outbox.splice(i, 1);             // never resend an undone answer
+    if (reachedServer) undos.push(prev.triplet_id);
+    if (i < 0 && lastProgress) {                 // it was already counted
+      lastProgress.total = Math.max(0, lastProgress.total - 1);
+      lastProgress.today = Math.max(0, lastProgress.today - 1);
+    }
+    if (current) queue.unshift(current);         // keep the set that was on screen
+    waiting = false;
+    $("triplet").classList.remove("hidden"); $("empty").classList.add("hidden");
+    render(prev);
+    showProgress();
+    toast("Previous set restored. Your earlier answer was withdrawn.");
+    sync();
   }
 
   $("unusable").onclick = () => submit("unusable", null);

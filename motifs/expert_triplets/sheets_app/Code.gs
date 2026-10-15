@@ -8,8 +8,9 @@
  * Tabs (created by "Triplets > 1. Set up"):
  *   crops        imported from crops.csv, plus each image's Drive file id
  *   triplets     every triplet ever created (append-only)
- *   annotations  every answer (append-only)
- *   retractions  undos: an answer is withdrawn, never deleted
+ *   annotations  every answer that currently counts
+ *   retractions  undone answers: undo moves the full row here, so nothing is
+ *                ever lost and `annotations` shows exactly what counts
  * Motif labels are never stored here, so the log stays blind and scores any
  * model run. "Triplets > Export for scoring" writes the tabs as CSVs for
  * score_triplets.py.
@@ -17,7 +18,7 @@
  * Setup and deployment steps are in README.md next to this file.
  */
 
-const APP_VERSION = 'triplets-sheets-v4';
+const APP_VERSION = 'triplets-sheets-v5';
 const INSTRUCTIONS_VERSION = 'v2';
 // How triplets are drawn (same defaults as the design notes):
 const TEST_FIRST = 150;    // answered test triplets per annotator before mixing
@@ -31,8 +32,8 @@ const HEADERS = {
                 'shown_middle', 'shown_right', 'choice', 'odd_crop',
                 'response_ms', 'shown_at', 'answered_at', 'app_version',
                 'instructions_version', 'render_version', 'unusable_crops'],
-  retractions: ['annotation_id', 'retracted_at'],
 };
+HEADERS.retractions = ['retracted_at'].concat(HEADERS.annotations);
 const POSITIONS = ['left', 'middle', 'right'];
 
 // ------------------------------------------------------------ properties --
@@ -73,7 +74,7 @@ function menuSetup() {
   for (const name of ['crops', 'triplets', 'annotations', 'retractions']) {
     if (!ss.getSheetByName(name)) ss.insertSheet(name);
     const sh = ss.getSheetByName(name);
-    if (HEADERS[name] && sh.getLastRow() === 0) appendRows_(sh, [HEADERS[name]]);
+    if (HEADERS[name]) ensureHeader_(sh, HEADERS[name]);
   }
   ui.alert('Set up done. Next: Triplets > 2. Import crops from Drive, then ' +
            'deploy the web app (README step 5).\n\nAccess key for the link: ' +
@@ -194,6 +195,22 @@ function appendRows_(sh, rows) {
   const width = Math.max(...rows.map(r => r.length));
   const padded = rows.map(r => r.concat(Array(width - r.length).fill('')).map(String));
   sh.getRange(start, 1, padded.length, width).setNumberFormat('@').setValues(padded);
+}
+
+/** Write `head` as row 1 of an empty tab (or one holding only an outdated
+ *  header). Refuses to touch a tab whose rows use another layout. */
+function ensureHeader_(sh, head) {
+  const n = sh.getLastRow();
+  if (n === 0 || n === 1) {
+    if (n === 1 && sh.getLastColumn() > head.length)
+      sh.getRange(1, 1, 1, sh.getLastColumn()).clearContent();
+    sh.getRange(1, 1, 1, head.length).setNumberFormat('@').setValues([head]);
+    return;
+  }
+  const cur = sh.getRange(1, 1, 1, head.length).getDisplayValues()[0];
+  if (cur.join() !== head.join())
+    throw new Error(`The "${sh.getName()}" tab has rows in an older layout. ` +
+                    'Delete every row below its header, then try again.');
 }
 
 function withLock_(fn) {
@@ -347,7 +364,7 @@ function saveAnswer_(who, body, st) {
   if (st.live.some(a => a.annotator === who && a.triplet_id === t.triplet_id))
     return { ok: true, duplicate: true };                       // resent or double-click
   const sh = sheet_('annotations');
-  const id = String(sh.getLastRow());             // header is row 1, ids 1, 2, ...
+  const id = Utilities.getUuid().replace(/-/g, '').slice(0, 12);
   const odd = body.choice === 'unusable' ? '' : order[POSITIONS.indexOf(body.choice)];
   const row = { annotation_id: id, triplet_id: t.triplet_id, annotator: who,
                 shown_left: order[0], shown_middle: order[1], shown_right: order[2],
@@ -362,15 +379,35 @@ function saveAnswer_(who, body, st) {
   return { ok: true, annotation_id: id };
 }
 
-/** One round trip per step: save any answers the page is holding, then hand
+/** Undo `who`'s answer to triplet `tid` (call inside the lock): delete its
+ *  row from `annotations` and keep the full row in `retractions`. */
+function retract_(who, tid, st) {
+  const a = st.live.find(x => x.annotator === who && x.triplet_id === tid);
+  if (!a) return;
+  const sh = sheet_('annotations');
+  const vals = sh.getDataRange().getDisplayValues();
+  const col = vals[0].indexOf('annotation_id');
+  const r = vals.findIndex((row, i) => i > 0 && row[col] === a.annotation_id);
+  const rs = sheet_('retractions');
+  ensureHeader_(rs, HEADERS.retractions);
+  appendRows_(rs, [[now_()].concat(HEADERS.annotations.map(h => a[h] || ''))]);
+  if (r > 0) sh.deleteRow(r + 1);
+  st.live = st.live.filter(x => x !== a);
+}
+
+/** One round trip per step: apply any undos, save any answers the page is
+ *  holding, then hand
  *  back up to `want` (max 3) more sets. Answers are deduplicated, so the page
  *  can safely resend after a failed request. Images are read after the lock
  *  is released. */
-function apiSync(token, who, answers, exclude, want) {
+function apiSync(token, who, answers, exclude, want, retracts) {
   who = checked_(token, who);
   const nAnnotators = apiConfig(token).annotators.length;
   const r = withLock_(() => {
     const st = state_();
+    // Undos first, so an undo followed by a new answer to the same set
+    // (sent together) ends with the new answer counted.
+    (retracts || []).forEach(tid => retract_(who, tid, st));
     const saved = [], failed = [];
     (answers || []).forEach(body => {
       const res = saveAnswer_(who, body, st);
@@ -387,7 +424,8 @@ function apiSync(token, who, answers, exclude, want) {
     }
     return { saved, failed, empty, picks, crops: st.crops, progress: progress_(who, st.live) };
   });
-  return { saved: r.saved, failed: r.failed, empty: r.empty, progress: r.progress,
+  return { saved: r.saved, failed: r.failed, retracted: retracts || [], empty: r.empty,
+           progress: r.progress,
            sets: r.picks.map(t => payload_(t, r.crops)) };
 }
 
@@ -404,20 +442,6 @@ function apiAnswer(token, body) {
     const res = saveAnswer_(who, body, st);
     return res.error ? res : Object.assign(res, { progress: progress_(who, st.live) });
   });
-}
-
-function apiUndo(token, who) {
-  who = checked_(token, who);
-  const r = withLock_(() => {
-    const mine = liveAnswers_().filter(a => a.annotator === who);
-    if (!mine.length) return { error: 'nothing to undo' };
-    const last = mine.reduce((a, b) => (Number(b.annotation_id) > Number(a.annotation_id) ? b : a));
-    appendRows_(sheet_('retractions'), [[last.annotation_id, now_()]]);
-    return { last: last, t: readTable_('triplets').find(x => x.triplet_id === last.triplet_id),
-             crops: readTable_('crops') };
-  });
-  if (r.error) return r;
-  return payload_(r.t, r.crops, [r.last.shown_left, r.last.shown_middle, r.last.shown_right]);
 }
 
 function apiProgress(token, who) {

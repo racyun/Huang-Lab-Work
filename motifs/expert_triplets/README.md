@@ -86,8 +86,8 @@ answers don't use up test crops or end up in the data.
 |---|---|
 | `crops` | `crops.csv` plus each image's Drive file id |
 | `triplets` | Every set ever shown: its three crop ids, train/test, shared or not |
-| `annotations` | Every answer: who, which set, left/middle/right order shown, the position clicked and the crop it maps to (or `unusable`, with `unusable_crops` listing exactly which images were flagged), response time, timestamps, versions |
-| `retractions` | Undos. An answer is withdrawn, not deleted. |
+| `annotations` | Every answer that counts: who, which set, left/middle/right order shown, the position clicked and the crop it maps to (or `unusable`, with `unusable_crops` listing exactly which images were flagged), response time, timestamps, versions |
+| `retractions` | Undone answers. Undo removes the row from `annotations` and keeps the full row here, so `annotations` shows exactly what counts. |
 
 Motif labels are never stored, so the same answers score any model run: v4,
 a new k, other edge rules, or the cell-only baseline. Values are written as
