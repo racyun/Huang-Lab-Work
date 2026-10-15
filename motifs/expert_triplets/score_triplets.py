@@ -55,13 +55,27 @@ KEY = ["condition", "image_id", "cell_id"]
 
 
 def load(data_dir: Path) -> pd.DataFrame:
-    db = sqlite3.connect(f"file:{data_dir / 'annotations.sqlite'}?mode=ro", uri=True)
-    ann = pd.read_sql_query(
-        "SELECT a.*, t.split, t.shared, t.created_for, t.crop_1, t.crop_2, t.crop_3 "
-        "FROM annotations a JOIN triplets t ON t.triplet_id = a.triplet_id "
-        "LEFT JOIN retractions r ON r.annotation_id = a.annotation_id "
-        "WHERE r.annotation_id IS NULL ORDER BY a.answered_at", db)
-    db.close()
+    """Live answers joined to their triplet and crops. Reads either the Google
+    Sheet export (triplets.csv, annotations.csv, retractions.csv, crops.csv
+    from "Triplets > Export for scoring") or a local annotations.sqlite."""
+    if (data_dir / "annotations.csv").exists():
+        read = lambda n: pd.read_csv(data_dir / f"{n}.csv", dtype=str,
+                                     keep_default_na=False)
+        a, t, r = read("annotations"), read("triplets"), read("retractions")
+        a = a[~a.annotation_id.isin(r.annotation_id)]
+        ann = a.merge(t[["triplet_id", "split", "shared", "created_for",
+                         "crop_1", "crop_2", "crop_3"]], on="triplet_id")
+        ann = ann.sort_values("answered_at").reset_index(drop=True)
+        ann["shared"] = ann["shared"].astype(int)
+        ann["odd_crop"] = ann["odd_crop"].replace("", None)
+    else:
+        db = sqlite3.connect(f"file:{data_dir / 'annotations.sqlite'}?mode=ro", uri=True)
+        ann = pd.read_sql_query(
+            "SELECT a.*, t.split, t.shared, t.created_for, t.crop_1, t.crop_2, t.crop_3 "
+            "FROM annotations a JOIN triplets t ON t.triplet_id = a.triplet_id "
+            "LEFT JOIN retractions r ON r.annotation_id = a.annotation_id "
+            "WHERE r.annotation_id IS NULL ORDER BY a.answered_at", db)
+        db.close()
     crops = pd.read_csv(data_dir / "crops.csv", dtype={"image_id": str})
     meta = crops.set_index("crop_id")[["condition", "image_id", "cell_id"]]
     for i in (1, 2, 3):

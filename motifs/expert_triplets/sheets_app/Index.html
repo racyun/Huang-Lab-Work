@@ -136,20 +136,17 @@
 
 <script>
 (() => {
-  const params = new URLSearchParams(location.search);
-  const token = params.get("token") || "";
   const POS = ["left", "middle", "right"];
   let who = null, current = null, shownAt = null, readyAt = null, busy = false;
 
   const $ = (id) => document.getElementById(id);
-  const withToken = (url) => token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url;
-  const api = async (path, body) => {
-    const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {};
-    const r = await fetch(withToken(path), opt);
-    const j = await r.json().catch(() => ({ error: "bad response" }));
-    if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
-    return j;
-  };
+  const TOKEN = <?!= JSON.stringify(token) ?>;
+  // google.script.run as a promise; server-side {error} becomes a rejection.
+  const call = (fn, ...args) => new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler((j) => (j && j.error ? reject(new Error(j.error)) : resolve(j)))
+      .withFailureHandler((e) => reject(new Error((e && e.message) || String(e))))[fn](TOKEN, ...args);
+  });
   const toast = (msg, err) => { const t = $("toast"); t.textContent = msg || ""; t.className = "toast" + (err ? " err" : ""); };
   const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } },
                   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
@@ -159,8 +156,8 @@
   async function showStart() {
     $("app").classList.add("hidden"); $("start").classList.remove("hidden");
     let cfg = { annotators: [] };
-    try { cfg = await api("/api/config"); }
-    catch (e) { $("names").textContent = "Can't reach the server (" + e.message + "). Check the link includes the token."; return; }
+    try { cfg = await call("apiConfig"); }
+    catch (e) { $("names").textContent = "Can't load the page (" + e.message + "). Check you used the full link you were sent."; return; }
     const box = $("names"); box.innerHTML = "";
     cfg.annotators.forEach((n) => {
       const b = document.createElement("button");
@@ -192,7 +189,7 @@
       img.alt = "Neighbourhood " + (i + 1);
       img.onload = () => { img.classList.add("loaded"); if (++loaded === 3) ready(); };
       img.onerror = () => toast("An image failed to load. Mark it Unusable or reload the page.", true);
-      img.src = withToken(src);
+      img.src = src;
       const k = document.createElement("span"); k.className = "key"; k.textContent = i + 1;
       b.append(img, k);
       b.onclick = () => submit(POS[i], b);
@@ -208,7 +205,7 @@
   async function loadNext() {
     busy = true; toast("");
     try {
-      const t = await api("/api/next?annotator=" + encodeURIComponent(who));
+      const t = await call("apiNext", who);
       if (t.empty) { $("triplet").classList.add("hidden"); $("empty").classList.remove("hidden"); return; }
       $("triplet").classList.remove("hidden"); $("empty").classList.add("hidden");
       render(t); refreshProgress();
@@ -220,7 +217,7 @@
     busy = true;
     if (btn) btn.classList.add("chosen");
     try {
-      await api("/api/answer", { annotator: who, triplet_id: current.triplet_id, order: current.order,
+      await call("apiAnswer", { annotator: who, triplet_id: current.triplet_id, order: current.order,
                                  choice, response_ms: Math.round(performance.now() - readyAt), shown_at: shownAt });
       await loadNext();
     } catch (e) { toast("Not saved: " + e.message + ". Try again.", true); if (btn) btn.classList.remove("chosen"); busy = false; }
@@ -230,14 +227,14 @@
     if (busy) return;
     busy = true;
     try {
-      const t = await api("/api/undo", { annotator: who });
+      const t = await call("apiUndo", who);
       render(t); refreshProgress(); toast("Previous set restored. Your earlier answer was withdrawn.");
     } catch (e) { toast(e.message === "nothing to undo" ? "Nothing to undo." : "Undo failed: " + e.message, true); busy = false; }
   }
 
   async function refreshProgress() {
     try {
-      const p = await api("/api/progress?annotator=" + encodeURIComponent(who));
+      const p = await call("apiProgress", who);
       $("progress").innerHTML = "<b>" + p.total + "</b> answered · " + p.today + " today";
     } catch {}
   }

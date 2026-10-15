@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Expert triplets, step 1 — freeze the image split and render a crop buffer.
 
-The annotation app (annotate_app.py) builds triplets on the fly from crops
-rendered here. Nothing in this script caps how many crops get annotated: run
+The annotation site (sheets_app/, a Google Apps Script web app) builds
+triplets on the fly from crops rendered here. Nothing in this script caps how many crops get annotated: run
 it again with a new --n-test / --n-train to append another batch whenever the
 experts get close to the end of the buffer. A crop only becomes part of the
 train or test set once the app actually shows it in a triplet.
@@ -30,7 +30,7 @@ apart so two crops never show mostly the same cells.
 Outputs (in --out-dir, default <root>/expert_triplets/):
     split.csv, render_config.json
     crops.csv            one row per rendered crop (append-only)
-    crops/<split>/*.png  the images the app serves
+    crops/<split>/*.jpg  the images the site serves (copy the folder to Drive)
 
 Usage:
     python prepare_crops.py --n-test 600 --n-train 1200
@@ -197,6 +197,9 @@ def main() -> None:
                          "differences visible (first run only)")
     ap.add_argument("--mark-neighbors", action="store_true",
                     help="also dot the 2-hop neighbours' centroids")
+    ap.add_argument("--image-format", choices=["jpg", "png"], default="jpg",
+                    help="jpg (quality 92) keeps each crop small enough for the "
+                         "Google Apps Script page to send quickly (first run only)")
     ap.add_argument("--assign-new", action="store_true",
                     help="append images missing from split.csv")
     ap.add_argument("--seed", type=int, default=None,
@@ -239,8 +242,10 @@ def main() -> None:
         cfg = {"crop_size": size, "contrast": args.contrast, "k": args.k,
                "marker_radius": round(float(np.median(nn)) * 0.7, 1),
                "mark_neighbors": bool(args.mark_neighbors),
+               "image_format": args.image_format,
                "render_version": f"2hop-k{args.k}-{size}px-{args.contrast}"
-                                 f"{'-nbr' if args.mark_neighbors else ''}-v1",
+                                 f"{'-nbr' if args.mark_neighbors else ''}"
+                                 f"-{args.image_format}-v1",
                "source_master_table": str(args.master_table.resolve()),
                "source_imgs_dir": str(args.imgs_dir.resolve()),
                "created_at": now()}
@@ -295,7 +300,7 @@ def main() -> None:
         both = new if old.empty else pd.concat([old, new], ignore_index=True)
         dupes = both["crop_id"].duplicated().sum()
         assert dupes == 0, f"{dupes} duplicate crop_id(s); refusing to write"
-        # Write-then-rename, so a running annotate_app never reads a
+        # Write-then-rename, so nothing reading the folder ever sees a
         # half-written file while a new batch is being appended.
         tmp = crops_path.with_suffix(".csv.tmp")
         both.to_csv(tmp, index=False)
@@ -346,9 +351,13 @@ def render_image(cond, img, n_img, which, groups, taken, args, cfg, half,
         inside = np.mean((np.abs(pos[members] - pos[i]) <= half).all(axis=1))
         nbr_xy = pos[members[members != i]] if cfg["mark_neighbors"] else None
         im, x0, y0 = render(rgb, cx, cy, half, cfg["marker_radius"], nbr_xy)
-        name = safe_name(cond, img, ids[i]) + ".png"
+        fmt = cfg.get("image_format", "png")
+        name = safe_name(cond, img, ids[i]) + "." + fmt
         rel = Path("crops") / which / name
-        im.save(out / rel)
+        if fmt == "jpg":
+            im.save(out / rel, quality=92, subsampling=0)
+        else:
+            im.save(out / rel)
         new_rows.append({
             "crop_id": f"{cond}/{img}/{ids[i]}", "split": which,
             "condition": cond, "image_id": img, "cell_id": int(ids[i]),
