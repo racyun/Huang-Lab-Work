@@ -295,7 +295,11 @@ def main() -> None:
         both = new if old.empty else pd.concat([old, new], ignore_index=True)
         dupes = both["crop_id"].duplicated().sum()
         assert dupes == 0, f"{dupes} duplicate crop_id(s); refusing to write"
-        both.to_csv(crops_path, index=False)
+        # Write-then-rename, so a running annotate_app never reads a
+        # half-written file while a new batch is being appended.
+        tmp = crops_path.with_suffix(".csv.tmp")
+        both.to_csv(tmp, index=False)
+        tmp.replace(crops_path)
     counts = (pd.read_csv(crops_path).split.value_counts().to_dict()
               if crops_path.exists() else {})
     print(f"\ncrops.csv now holds {counts} (batch {batch}, seed {seed})")
