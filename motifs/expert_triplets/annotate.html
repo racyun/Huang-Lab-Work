@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odd One Out</title>
+<style>
+  /* A fixed dark surround on purpose: fluorescence crops are judged against a
+     dark field, and both experts should see them under the same conditions. */
+  :root {
+    --bg: #111317; --panel: #1a1d23; --line: #2c313a; --text: #e8eaed;
+    --muted: #9aa1ab; --accent: #f2b84b; --accent-ink: #1a1404;
+    --danger: #e0786b; --ok: #79c08f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; align-items: baseline; justify-content: space-between;
+           gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+  .muted { color: var(--muted); }
+  .who { font-size: 14px; }
+  .who button { background: none; border: 0; color: var(--muted); cursor: pointer;
+                text-decoration: underline; font: inherit; padding: 0 0 0 6px; }
+
+  .prompt { font-size: 17px; margin: 4px 0 14px; }
+  .legend { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+  .legend b.r { color: #ff6b6b; } .legend b.g { color: #6bdc7b; } .legend b.b { color: #7aa7ff; }
+
+  .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .crop { position: relative; padding: 0; border: 2px solid var(--line);
+          border-radius: 10px; background: #000; cursor: pointer; overflow: hidden;
+          aspect-ratio: 1 / 1; transition: border-color .12s, transform .12s; }
+  .crop:hover:not(:disabled), .crop:focus-visible { border-color: var(--accent); outline: none; }
+  .crop:disabled { cursor: progress; }
+  .crop img { display: block; width: 100%; height: 100%; object-fit: contain;
+              image-rendering: auto; opacity: 0; transition: opacity .15s; }
+  .crop img.loaded { opacity: 1; }
+  .crop .key { position: absolute; top: 8px; left: 8px; min-width: 26px; height: 26px;
+               padding: 0 7px; border-radius: 6px; background: rgba(0,0,0,.65);
+               color: var(--text); font-weight: 600; font-size: 14px;
+               display: grid; place-items: center; }
+  .crop.chosen { border-color: var(--accent); transform: scale(.985); }
+
+  .actions { display: flex; gap: 10px; align-items: center; justify-content: space-between;
+             flex-wrap: wrap; margin-top: 16px; }
+  .btn { border: 1px solid var(--line); background: var(--panel); color: var(--text);
+         border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
+  .btn:hover:not(:disabled) { border-color: var(--muted); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.unusable { border-color: #5a3b37; color: var(--danger); }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  kbd { font: 12px ui-monospace, Menlo, monospace; border: 1px solid var(--line);
+        border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; margin-left: 4px;
+        color: var(--muted); }
+  .progress { font-size: 14px; color: var(--muted); }
+  .progress b { color: var(--text); }
+  .toast { min-height: 22px; font-size: 14px; color: var(--muted); margin-top: 10px; }
+  .toast.err { color: var(--danger); }
+
+  details { margin-top: 26px; border-top: 1px solid var(--line); padding-top: 14px;
+            color: var(--muted); font-size: 14px; }
+  details summary { cursor: pointer; color: var(--text); }
+  details li { margin: 4px 0; }
+
+  /* start screen */
+  .start { max-width: 520px; margin: 8vh auto 0; background: var(--panel);
+           border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
+  .start h1 { margin-bottom: 8px; }
+  .names { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+  .start input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+                 background: var(--bg); color: var(--text); font: inherit; }
+  .hidden { display: none !important; }
+  .empty { text-align: center; padding: 60px 16px; color: var(--muted); }
+
+  @media (max-width: 720px) {
+    .row { grid-template-columns: 1fr; max-width: 420px; margin: 0 auto; }
+    .prompt { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="start" class="start hidden">
+  <h1>Odd One Out</h1>
+  <p class="muted">You'll see three cell neighbourhoods at a time. Pick the one
+  that doesn't belong with the other two. Answer by eye, and don't overthink it:
+  a few seconds per set is right.</p>
+  <div class="names" id="names"></div>
+  <form id="other">
+    <input id="otherName" placeholder="Or type your name" autocomplete="name">
+  </form>
+</div>
+
+<main id="app" class="hidden">
+  <header>
+    <h1>Odd One Out</h1>
+    <span class="who muted">Annotating as <b id="whoName"></b><button id="switch">switch</button></span>
+  </header>
+
+  <div class="prompt">Which neighbourhood is the <b>odd one out</b>? Judge the
+  arrangement of cells around the marked centre cell.</div>
+  <div class="legend">
+    <b class="r">Red</b> TAGLN · <b class="g">Green</b> VE-cadherin · <b class="b">Blue</b> DAPI ·
+    white ticks mark the centre cell
+  </div>
+
+  <div id="triplet">
+    <div class="row" id="row"></div>
+    <div class="actions">
+      <div>
+        <button class="btn unusable" id="unusable">Unusable<kbd>X</kbd></button>
+        <button class="btn" id="undo">Undo last<kbd>Z</kbd></button>
+      </div>
+      <div class="progress" id="progress"></div>
+    </div>
+    <div class="toast" id="toast"></div>
+  </div>
+  <div id="empty" class="empty hidden">
+    <p>That's all the crops prepared so far. Thank you!</p>
+    <p>More can be added any time. Check back later or let Rachel know.</p>
+  </div>
+
+  <details>
+    <summary>Instructions</summary>
+    <ul>
+      <li>Click the neighbourhood that is <b>least like the other two</b>, or press <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd>.</li>
+      <li>There's no right answer key. Go with your first impression. If all three look alike, still pick the one that differs most.</li>
+      <li>Press <b>Unusable</b> (<kbd>X</kbd>) only when a crop can't be judged: blurry, bad segmentation, centre cell at the image edge, or mostly empty.</li>
+      <li>Misclicked? <b>Undo last</b> (<kbd>Z</kbd>) brings the previous set back.</li>
+      <li>Stop whenever you like. Every answer is saved as you go.</li>
+    </ul>
+  </details>
+</main>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const token = params.get("token") || "";
+  const POS = ["left", "middle", "right"];
+  let who = null, current = null, shownAt = null, readyAt = null, busy = false;
+
+  const $ = (id) => document.getElementById(id);
+  const withToken = (url) => token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url;
+  const api = async (path, body) => {
+    const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {};
+    const r = await fetch(withToken(path), opt);
+    const j = await r.json().catch(() => ({ error: "bad response" }));
+    if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+    return j;
+  };
+  const toast = (msg, err) => { const t = $("toast"); t.textContent = msg || ""; t.className = "toast" + (err ? " err" : ""); };
+  const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+                  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+                  del(k) { try { localStorage.removeItem(k); } catch {} } };
+
+  // ---------- start screen ----------
+  async function showStart() {
+    $("app").classList.add("hidden"); $("start").classList.remove("hidden");
+    let cfg = { annotators: [] };
+    try { cfg = await api("/api/config"); }
+    catch (e) { $("names").textContent = "Can't reach the server (" + e.message + "). Check the link includes the token."; return; }
+    const box = $("names"); box.innerHTML = "";
+    cfg.annotators.forEach((n) => {
+      const b = document.createElement("button");
+      b.className = "btn primary"; b.textContent = n;
+      b.onclick = () => begin(n);
+      box.appendChild(b);
+    });
+  }
+  $("other").onsubmit = (e) => { e.preventDefault(); const n = $("otherName").value.trim(); if (n) begin(n); };
+  $("switch").onclick = () => { store.del("annotator"); who = null; showStart(); };
+
+  function begin(name) {
+    who = name; store.set("annotator", name);
+    $("whoName").textContent = name;
+    $("start").classList.add("hidden"); $("app").classList.remove("hidden");
+    loadNext();
+  }
+
+  // ---------- triplets ----------
+  function render(t) {
+    current = t; readyAt = null; shownAt = new Date().toISOString();
+    const row = $("row"); row.innerHTML = "";
+    let loaded = 0;
+    t.images.forEach((src, i) => {
+      const b = document.createElement("button");
+      b.className = "crop"; b.disabled = true;
+      b.setAttribute("aria-label", "Neighbourhood " + (i + 1) + " is the odd one out");
+      const img = new Image();
+      img.alt = "Neighbourhood " + (i + 1);
+      img.onload = () => { img.classList.add("loaded"); if (++loaded === 3) ready(); };
+      img.onerror = () => toast("An image failed to load. Mark it Unusable or reload the page.", true);
+      img.src = withToken(src);
+      const k = document.createElement("span"); k.className = "key"; k.textContent = i + 1;
+      b.append(img, k);
+      b.onclick = () => submit(POS[i], b);
+      row.appendChild(b);
+    });
+  }
+  function ready() {
+    readyAt = performance.now();
+    document.querySelectorAll(".crop").forEach((b) => (b.disabled = false));
+    busy = false;
+  }
+
+  async function loadNext() {
+    busy = true; toast("");
+    try {
+      const t = await api("/api/next?annotator=" + encodeURIComponent(who));
+      if (t.empty) { $("triplet").classList.add("hidden"); $("empty").classList.remove("hidden"); return; }
+      $("triplet").classList.remove("hidden"); $("empty").classList.add("hidden");
+      render(t); refreshProgress();
+    } catch (e) { toast("Couldn't load the next set: " + e.message, true); busy = false; }
+  }
+
+  async function submit(choice, btn) {
+    if (busy || !current || readyAt === null) return;
+    busy = true;
+    if (btn) btn.classList.add("chosen");
+    try {
+      await api("/api/answer", { annotator: who, triplet_id: current.triplet_id, order: current.order,
+                                 choice, response_ms: Math.round(performance.now() - readyAt), shown_at: shownAt });
+      await loadNext();
+    } catch (e) { toast("Not saved: " + e.message + ". Try again.", true); if (btn) btn.classList.remove("chosen"); busy = false; }
+  }
+
+  async function undo() {
+    if (busy) return;
+    busy = true;
+    try {
+      const t = await api("/api/undo", { annotator: who });
+      render(t); refreshProgress(); toast("Previous set restored. Your earlier answer was withdrawn.");
+    } catch (e) { toast(e.message === "nothing to undo" ? "Nothing to undo." : "Undo failed: " + e.message, true); busy = false; }
+  }
+
+  async function refreshProgress() {
+    try {
+      const p = await api("/api/progress?annotator=" + encodeURIComponent(who));
+      $("progress").innerHTML = "<b>" + p.total + "</b> answered · " + p.today + " today";
+    } catch {}
+  }
+
+  $("unusable").onclick = () => submit("unusable", null);
+  $("undo").onclick = undo;
+  document.addEventListener("keydown", (e) => {
+    if (!who || e.target.tagName === "INPUT" || e.metaKey || e.ctrlKey || e.altKey) return;
+    const k = e.key.toLowerCase();
+    if (["1", "2", "3"].includes(k)) { const i = +k - 1; submit(POS[i], document.querySelectorAll(".crop")[i]); }
+    else if (k === "x") submit("unusable", null);
+    else if (k === "z") undo();
+  });
+
+  const saved = store.get("annotator");
+  if (saved) begin(saved); else showStart();
+})();
+</script>
+</body>
+</html>
