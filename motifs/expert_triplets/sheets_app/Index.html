@@ -42,6 +42,17 @@
                color: var(--text); font-weight: 600; font-size: 14px;
                display: grid; place-items: center; }
   .crop.chosen { border-color: var(--accent); transform: scale(.985); }
+  .cell { display: flex; flex-direction: column; gap: 8px; }
+  .cell.flagged .crop { border-color: var(--danger); }
+  .cell.flagged .crop img { opacity: .35; }
+  .cell .badge { position: absolute; inset: auto 0 0 0; padding: 6px; text-align: center;
+                 background: rgba(120, 30, 24, .85); color: #fff; font-size: 13px; font-weight: 600;
+                 display: none; }
+  .cell.flagged .badge { display: block; }
+  .flag { border: 1px solid var(--line); background: transparent; color: var(--muted);
+          border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  .flag:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+  .cell.flagged .flag { border-color: var(--danger); color: var(--danger); background: rgba(224, 120, 107, .1); }
 
   .actions { display: flex; gap: 10px; align-items: center; justify-content: space-between;
              flex-wrap: wrap; margin-top: 16px; }
@@ -110,7 +121,7 @@
     <div class="row" id="row"></div>
     <div class="actions">
       <div>
-        <button class="btn unusable" id="unusable">Unusable<kbd>X</kbd></button>
+        <button class="btn unusable" id="unusable" disabled>Submit as unusable<kbd>X</kbd></button>
         <button class="btn" id="undo">Undo last<kbd>Z</kbd></button>
       </div>
       <div class="progress" id="progress"></div>
@@ -127,7 +138,7 @@
     <ul>
       <li>Click the neighbourhood that is <b>least like the other two</b>, or press <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd>.</li>
       <li>There's no right answer key. Go with your first impression. If all three look alike, still pick the one that differs most.</li>
-      <li>Press <b>Unusable</b> (<kbd>X</kbd>) only when a crop can't be judged: blurry, bad segmentation, centre cell at the image edge, or mostly empty.</li>
+      <li>If an image can't be judged (blurry, bad segmentation, centre cell at the image edge, or mostly empty), click <b>Flag unusable</b> under it, or press <kbd>Q</kbd> <kbd>W</kbd> <kbd>E</kbd>. Flag as many of the three as apply, then <b>Submit as unusable</b> (<kbd>X</kbd>). Click a flag again to clear it.</li>
       <li>Misclicked? <b>Undo last</b> (<kbd>Z</kbd>) brings the previous set back.</li>
       <li>Stop whenever you like. Every answer is saved as you go.</li>
     </ul>
@@ -138,6 +149,7 @@
 (() => {
   const POS = ["left", "middle", "right"];
   let who = null, current = null, shownAt = null, readyAt = null, busy = false;
+  let flagged = new Set();                       // positions flagged unusable
 
   const $ = (id) => document.getElementById(id);
   const TOKEN = <?!= JSON.stringify(token) ?>;
@@ -179,6 +191,7 @@
   // ---------- triplets ----------
   function render(t) {
     current = t; readyAt = null; shownAt = new Date().toISOString();
+    flagged = new Set(); syncFlags();
     const row = $("row"); row.innerHTML = "";
     let loaded = 0;
     t.images.forEach((src, i) => {
@@ -188,17 +201,24 @@
       const img = new Image();
       img.alt = "Neighbourhood " + (i + 1);
       img.onload = () => { img.classList.add("loaded"); if (++loaded === 3) ready(); };
-      img.onerror = () => toast("An image failed to load. Mark it Unusable or reload the page.", true);
+      img.onerror = () => toast("An image failed to load. Reload the page; if it keeps failing, flag it unusable.", true);
       img.src = src;
       const k = document.createElement("span"); k.className = "key"; k.textContent = i + 1;
-      b.append(img, k);
+      const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = "Flagged unusable";
+      b.append(img, k, badge);
       b.onclick = () => submit(POS[i], b);
-      row.appendChild(b);
+      const f = document.createElement("button");
+      f.className = "flag"; f.disabled = true;
+      f.innerHTML = "Flag unusable<kbd>" + "QWE"[i] + "</kbd>";
+      f.onclick = () => toggleFlag(i);
+      const cell = document.createElement("div"); cell.className = "cell";
+      cell.append(b, f);
+      row.appendChild(cell);
     });
   }
   function ready() {
     readyAt = performance.now();
-    document.querySelectorAll(".crop").forEach((b) => (b.disabled = false));
+    document.querySelectorAll(".crop, .flag").forEach((b) => (b.disabled = false));
     busy = false;
   }
 
@@ -212,13 +232,34 @@
     } catch (e) { toast("Couldn't load the next set: " + e.message, true); busy = false; }
   }
 
+  function toggleFlag(i) {
+    if (busy || !current || readyAt === null) return;
+    flagged.has(i) ? flagged.delete(i) : flagged.add(i);
+    syncFlags(); toast("");
+  }
+  function syncFlags() {
+    document.querySelectorAll(".cell").forEach((c, i) => c.classList.toggle("flagged", flagged.has(i)));
+    const n = flagged.size;
+    $("unusable").disabled = n === 0;
+    $("unusable").innerHTML = (n ? "Submit as unusable (" + n + " flagged)" : "Submit as unusable") + "<kbd>X</kbd>";
+  }
+
   async function submit(choice, btn) {
     if (busy || !current || readyAt === null) return;
+    if (choice !== "unusable" && flagged.size) {
+      toast("You've flagged an image as unusable. Submit as unusable (X), or clear the flag to pick the odd one out.", true);
+      return;
+    }
+    if (choice === "unusable" && !flagged.size) {
+      toast("Flag the unusable image(s) first: the button under each image, or Q / W / E.", true);
+      return;
+    }
+    const unusable = [...flagged].sort().map((i) => current.order[i]);
     busy = true;
     if (btn) btn.classList.add("chosen");
     try {
       await call("apiAnswer", { annotator: who, triplet_id: current.triplet_id, order: current.order,
-                                 choice, response_ms: Math.round(performance.now() - readyAt), shown_at: shownAt });
+                                 choice, unusable, response_ms: Math.round(performance.now() - readyAt), shown_at: shownAt });
       await loadNext();
     } catch (e) { toast("Not saved: " + e.message + ". Try again.", true); if (btn) btn.classList.remove("chosen"); busy = false; }
   }
@@ -245,6 +286,7 @@
     if (!who || e.target.tagName === "INPUT" || e.metaKey || e.ctrlKey || e.altKey) return;
     const k = e.key.toLowerCase();
     if (["1", "2", "3"].includes(k)) { const i = +k - 1; submit(POS[i], document.querySelectorAll(".crop")[i]); }
+    else if (["q", "w", "e"].includes(k)) toggleFlag("qwe".indexOf(k));
     else if (k === "x") submit("unusable", null);
     else if (k === "z") undo();
   });

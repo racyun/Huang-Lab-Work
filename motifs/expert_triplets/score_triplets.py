@@ -159,6 +159,19 @@ def main() -> None:
         "unusable": int((sub.choice == "unusable").sum()),
         "by_annotator": sub.groupby("annotator").size().to_dict(),
         "triplets": int(usable.triplet_id.nunique())}
+    # Individual crops flagged unusable (all splits): a QC list to trace back
+    # to segmentation or imaging problems. The site stops serving them.
+    if "unusable_crops" in ann.columns:
+        flags = (ann["unusable_crops"].fillna("").astype(str).str.split(";")
+                 .explode().loc[lambda s: s != ""])
+        if len(flags):
+            crops_meta = pd.read_csv(args.data_dir / "crops.csv", dtype={"image_id": str})
+            fl = (flags.value_counts().rename("times_flagged").rename_axis("crop_id")
+                  .reset_index().merge(crops_meta, on="crop_id", how="left"))
+            fl.to_csv(args.data_dir / "flagged_crops.csv", index=False)
+            report["flagged_crops"] = int(len(fl))
+            print(f"{len(fl)} crop(s) flagged unusable -> flagged_crops.csv "
+                  f"(from {fl.image_id.nunique()} image(s))")
     print(f"\n{args.split.upper()} answers: {len(usable)} usable, "
           f"{report['answers']['unusable']} unusable, over "
           f"{report['answers']['triplets']} triplet(s); "

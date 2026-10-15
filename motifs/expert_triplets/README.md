@@ -1,7 +1,8 @@
 # Expert triplets: odd-one-out validation of the motifs
 
 Prof. Huang and Carver see three real neighbourhood crops at a time and click
-the one that doesn't belong, or mark the set **Unusable**. The site is a Google
+the one that doesn't belong. If any image can't be judged, they flag it
+(one, two or all three) and submit the set as unusable. The site is a Google
 Apps Script web app attached to a Google Sheet. It's always on, free, and needs
 no server: Google hosts the page, the Sheet stores the answers, and the crop
 images stay private in your Drive.
@@ -85,7 +86,7 @@ answers don't use up test crops or end up in the data.
 |---|---|
 | `crops` | `crops.csv` plus each image's Drive file id |
 | `triplets` | Every set ever shown: its three crop ids, train/test, shared or not |
-| `annotations` | Every answer: who, which set, left/middle/right order shown, the position clicked and the crop it maps to (or `unusable`), response time, timestamps, versions |
+| `annotations` | Every answer: who, which set, left/middle/right order shown, the position clicked and the crop it maps to (or `unusable`, with `unusable_crops` listing exactly which images were flagged), response time, timestamps, versions |
 | `retractions` | Undos. An answer is withdrawn, not deleted. |
 
 Motif labels are never stored, so the same answers score any model run: v4,
@@ -104,6 +105,9 @@ plain text so ids and timestamps are never reformatted by Sheets.
 - **Shared sets.** About 1 in 5 test sets goes to both annotators. Their
   agreement is the human ceiling.
 - **Position is randomised** each time a set is shown.
+- **Flagged crops are retired.** A crop anyone flags unusable is never served
+  again. The scorer lists them in `flagged_crops.csv` (with image and cell) so
+  you can check them for segmentation or imaging problems.
 - **Two people at once:** a script lock makes sure they're never given the
   same test crop.
 

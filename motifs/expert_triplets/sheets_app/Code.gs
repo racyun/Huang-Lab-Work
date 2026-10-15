@@ -17,8 +17,8 @@
  * Setup and deployment steps are in README.md next to this file.
  */
 
-const APP_VERSION = 'triplets-sheets-v1';
-const INSTRUCTIONS_VERSION = 'v1';
+const APP_VERSION = 'triplets-sheets-v2';
+const INSTRUCTIONS_VERSION = 'v2';
 // How triplets are drawn (same defaults as the design notes):
 const TEST_FIRST = 150;    // answered test triplets per annotator before mixing
 const TEST_SHARE = 0.5;    // after that, share of new triplets that are test
@@ -30,7 +30,7 @@ const HEADERS = {
   annotations: ['annotation_id', 'triplet_id', 'annotator', 'shown_left',
                 'shown_middle', 'shown_right', 'choice', 'odd_crop',
                 'response_ms', 'shown_at', 'answered_at', 'app_version',
-                'instructions_version', 'render_version'],
+                'instructions_version', 'render_version', 'unusable_crops'],
   retractions: ['annotation_id', 'retracted_at'],
 };
 const POSITIONS = ['left', 'middle', 'right'];
@@ -207,6 +207,14 @@ function liveAnswers_() {
   return readTable_('annotations').filter(a => !gone.has(a.annotation_id));
 }
 
+/** Crops anyone has flagged unusable (in an answer that wasn't undone). */
+function flaggedCrops_(live) {
+  const out = new Set();
+  live.forEach(a => String(a.unusable_crops || '').split(';').filter(Boolean)
+                      .forEach(c => out.add(c)));
+  return out;
+}
+
 function shuffle_(a) {
   for (let i = a.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -230,12 +238,12 @@ function payload_(t, crops, order) {
 
 /** Three crops of `split` from three different images. Test crops are used
  *  once ever; train crops are reused, least-used first. */
-function pick_(split, crops, triplets) {
+function pick_(split, crops, triplets, flagged) {
   const used = {};
   triplets.forEach(t => [t.crop_1, t.crop_2, t.crop_3].forEach(c => {
     used[c] = (used[c] || 0) + 1;
   }));
-  let cands = shuffle_(crops.filter(c => c.split === split &&
+  let cands = shuffle_(crops.filter(c => c.split === split && !flagged.has(c.crop_id) &&
                                          (split !== 'test' || !used[c.crop_id])));
   if (split === 'train') cands.sort((a, b) => (used[a.crop_id] || 0) - (used[b.crop_id] || 0));
   const chosen = [], images = new Set();
@@ -297,8 +305,9 @@ function apiNext(token, who) {
     triplets.forEach(t => { split0[t.triplet_id] = t.split; });
     const nTest = live.filter(a => a.annotator === who && split0[a.triplet_id] === 'test').length;
     let split = nTest < TEST_FIRST ? 'test' : (Math.random() < TEST_SHARE ? 'test' : 'train');
-    let chosen = pick_(split, crops, triplets);
-    if (!chosen && split === 'test') { split = 'train'; chosen = pick_('train', crops, triplets); }
+    const flagged = flaggedCrops_(live);
+    let chosen = pick_(split, crops, triplets, flagged);
+    if (!chosen && split === 'test') { split = 'train'; chosen = pick_('train', crops, triplets, flagged); }
     if (!chosen) return { empty: true };
     const nAnnotators = apiConfig(token).annotators.length;
     const shared = split === 'test' && nAnnotators > 1 && Math.random() < 1 / SHARED_EVERY;
@@ -321,6 +330,10 @@ function apiAnswer(token, body) {
     if (order.length !== 3 || order.slice().sort().join() !== ids.slice().sort().join())
       return { error: 'order does not match the triplet' };
     if (POSITIONS.concat(['unusable']).indexOf(body.choice) < 0) return { error: 'bad choice' };
+    const unusable = Array.from(new Set(body.unusable || []));
+    if (unusable.some(c => ids.indexOf(c) < 0)) return { error: 'flagged crop is not in this set' };
+    if ((body.choice === 'unusable') !== (unusable.length > 0))
+      return { error: 'unusable needs at least one flagged image, and a pick needs none' };
     if (t.created_for !== who && t.shared !== '1')
       return { error: 'triplet belongs to another annotator' };
     if (liveAnswers_().some(a => a.annotator === who && a.triplet_id === t.triplet_id))
@@ -334,7 +347,8 @@ function apiAnswer(token, body) {
                   response_ms: String(Math.round(Number(body.response_ms) || 0) || ''),
                   shown_at: String(body.shown_at || ''), answered_at: now_(),
                   app_version: APP_VERSION, instructions_version: INSTRUCTIONS_VERSION,
-                  render_version: prop_('RENDER_VERSION') || '' };
+                  render_version: prop_('RENDER_VERSION') || '',
+                  unusable_crops: unusable.join(';') };
     appendRows_(sh, [HEADERS.annotations.map(h => row[h])]);
     return { ok: true, annotation_id: id };
   });
