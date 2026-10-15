@@ -18,7 +18,7 @@
  * Setup and deployment steps are in README.md next to this file.
  */
 
-const APP_VERSION = 'triplets-sheets-v5';
+const APP_VERSION = 'triplets-sheets-v6';
 const INSTRUCTIONS_VERSION = 'v2';
 // How triplets are drawn (same defaults as the design notes):
 const TEST_FIRST = 150;    // answered test triplets per annotator before mixing
@@ -48,6 +48,7 @@ function onOpen() {
     .addItem('2. Import crops from Drive', 'menuImportCrops')
     .addSeparator()
     .addItem('Export for scoring', 'menuExport')
+    .addItem('Remove undone answers', 'menuSweep')
     .addItem('Show settings', 'menuInfo')
     .addToUi();
 }
@@ -94,6 +95,12 @@ function menuExport() {
   const url = exportForScoring_();
   SpreadsheetApp.getUi().alert('Wrote crops.csv, triplets.csv, annotations.csv ' +
     'and retractions.csv to the "exports" folder:\n' + url);
+}
+
+function menuSweep() {
+  const n = withLock_(() => sweepRetracted_());
+  SpreadsheetApp.getUi().alert(`Removed ${n} undone answer(s) from the annotations tab ` +
+                               '(they are kept in retractions).');
 }
 
 function menuInfo() {
@@ -379,20 +386,38 @@ function saveAnswer_(who, body, st) {
   return { ok: true, annotation_id: id };
 }
 
-/** Undo `who`'s answer to triplet `tid` (call inside the lock): delete its
- *  row from `annotations` and keep the full row in `retractions`. */
+/** Undo `who`'s answer to triplet `tid` (call inside the lock): keep the full
+ *  row in `retractions`, then remove it from `annotations`. */
 function retract_(who, tid, st) {
   const a = st.live.find(x => x.annotator === who && x.triplet_id === tid);
   if (!a) return;
-  const sh = sheet_('annotations');
-  const vals = sh.getDataRange().getDisplayValues();
-  const col = vals[0].indexOf('annotation_id');
-  const r = vals.findIndex((row, i) => i > 0 && row[col] === a.annotation_id);
   const rs = sheet_('retractions');
   ensureHeader_(rs, HEADERS.retractions);
   appendRows_(rs, [[now_()].concat(HEADERS.annotations.map(h => a[h] || ''))]);
-  if (r > 0) sh.deleteRow(r + 1);
   st.live = st.live.filter(x => x !== a);
+  sweepRetracted_();
+}
+
+/** Remove every answer listed in `retractions` from `annotations`, including
+ *  any left behind earlier. Deleting can fail (Sheets refuses to delete the
+ *  last row under a frozen header), so a row that can't be deleted is cleared
+ *  instead; blank rows are ignored everywhere. Returns how many it removed. */
+function sweepRetracted_() {
+  const gone = new Set(readTable_('retractions').map(r => r.annotation_id).filter(Boolean));
+  const sh = sheet_('annotations');
+  const vals = sh.getDataRange().getDisplayValues();
+  const col = vals[0].indexOf('annotation_id');
+  let n = 0;
+  for (let i = vals.length - 1; i >= 1; i--) {         // bottom up: indices stay valid
+    if (!vals[i][col] || !gone.has(vals[i][col])) continue;
+    try { sh.deleteRow(i + 1); }
+    catch (e) {
+      console.warn('deleteRow failed, clearing the row instead: ' + e.message);
+      sh.getRange(i + 1, 1, 1, vals[0].length).clearContent();
+    }
+    n++;
+  }
+  return n;
 }
 
 /** One round trip per step: apply any undos, save any answers the page is
