@@ -115,9 +115,25 @@ class NeighborhoodEncoder(nn.Module):
         heads: int = 4,
         edge_dim: int = 4,
         dropout: float = 0.2,
+        embed_norm: bool = True,
     ):
         super().__init__()
         self.dropout = dropout
+        # LayerNorm on the pooled embedding. Without it nothing bounds |h|:
+        # nt_xent_loss L2-normalises z before computing similarities, so the
+        # contrastive objective is completely scale-invariant and cannot see
+        # the magnitude of h, let alone penalise it. The adversary, which
+        # consumes h raw, then receives ever-larger inputs, emits ever-larger
+        # logits, and sends an ever-larger reversed gradient back - a runaway
+        # that drove the v4 run's adversary loss from 1.31 to 1476.9 in five
+        # epochs and left embeddings with values near 1e6 and an effective rank
+        # of 1.1 out of 64. Normalising here removes the feedback path.
+        #
+        # Default True. Checkpoints trained before this existed record no
+        # `embed_norm` in their config and must be loaded with False, so their
+        # (collapsed) behaviour is reproduced exactly rather than silently
+        # altered.
+        self.embed_norm = nn.LayerNorm(emb_dim) if embed_norm else nn.Identity()
 
         # Layer 1: in_dim -> hidden (concatenated heads => hidden*heads out).
         self.conv1 = GATv2Conv(in_dim, hidden_dim, heads=heads,
@@ -157,13 +173,37 @@ class NeighborhoodEncoder(nn.Module):
         h = h2 + self.res_proj(h)                       # residual (methodology §3e)
 
         h = self.conv3(h, edge_index, edge_attr)        # no activation on last layer
-        return global_mean_pool(h, batch)               # mean readout (§4)
+        return self.embed_norm(global_mean_pool(h, batch))   # mean readout (§4)
 
     def forward(self, data) -> Tuple[torch.Tensor, torch.Tensor]:
         edge_attr = getattr(data, "edge_attr", None)
         h = self.encode(data.x, data.edge_index, edge_attr, data.batch)
         z = self.proj(h)
         return h, z
+
+
+@torch.no_grad()
+def effective_rank(h: torch.Tensor) -> float:
+    """How many dimensions the embedding is actually using.
+
+    Participation ratio of the covariance eigenvalues, (sum l)^2 / sum(l^2):
+    equals d when variance is spread evenly over d dimensions and 1 when a
+    single direction carries everything.
+
+    This is the number that exposes dimensional collapse, and nothing else in
+    the pipeline reveals it - loss curves, probe accuracies, silhouette and
+    cluster stability all keep returning plausible values while the
+    representation quietly becomes a line. Logged every epoch so a collapsing
+    run is visible while it trains rather than months later.
+    """
+    if h.shape[0] < 2:
+        return float("nan")
+    hc = (h - h.mean(0)).float()
+    ev = torch.linalg.svdvals(hc) ** 2
+    s = ev.sum()
+    if s <= 0:
+        return float("nan")
+    return float(s ** 2 / (ev ** 2).sum())
 
 
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:

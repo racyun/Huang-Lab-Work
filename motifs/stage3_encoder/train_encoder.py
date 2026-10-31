@@ -54,7 +54,7 @@ if str(ROOT) not in sys.path:
 
 from models.neighborhood_encoder import (  # noqa: E402
     NeighborhoodEncoder, ConditionAdversary, EndMTHead,
-    nt_xent_loss, batchnorm_intensities_,
+    nt_xent_loss, batchnorm_intensities_, effective_rank,
 )
 
 INTENSITY_COLS = [
@@ -299,6 +299,18 @@ def main() -> None:
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--min-rank-frac", type=float, default=0.15,
+                    help="an epoch counts as healthy only if its embedding uses at "
+                         "least this fraction of emb_dim. Guards the best-checkpoint "
+                         "rule against saving a collapsed encoder.")
+    ap.add_argument("--max-h-norm", type=float, default=1e3,
+                    help="embedding norm above which an epoch is treated as diverged")
+    ap.add_argument("--clip-grad", type=float, default=5.0,
+                    help="max gradient norm. The v4 run had no clipping, which "
+                         "let the reversed adversary gradient blow up the encoder.")
+    ap.add_argument("--no-embed-norm", action="store_true",
+                    help="disable LayerNorm on the embedding (reproduces the old, "
+                         "collapse-prone behaviour; not recommended)")
     ap.add_argument("--seed", type=int, default=0,
                     help="random seed for torch/numpy/python. Change it to train an "
                          "independent encoder for the reproducibility test.")
@@ -388,7 +400,8 @@ def main() -> None:
 
     model = NeighborhoodEncoder(in_dim=in_dim, hidden_dim=args.hidden_dim,
                                 emb_dim=args.emb_dim, heads=args.heads,
-                                edge_dim=4, dropout=args.dropout).to(device)
+                                edge_dim=4, dropout=args.dropout,
+                                embed_norm=not args.no_embed_norm).to(device)
 
     # ----- EndMT-retention head (optional): anchors biology, trained normally -----
     endmt_head = None
@@ -453,6 +466,7 @@ def main() -> None:
         if endmt_head is not None:
             endmt_head.train()
         ep_loss = ep_con = ep_adv = ep_adv_acc = ep_endmt = 0.0; nb = 0
+        ep_gnorm = ep_rank = ep_hnorm = 0.0
         for view_a, view_b in loader:
             for grp in opt.param_groups:
                 grp["lr"] = lr_at(step)
@@ -488,14 +502,28 @@ def main() -> None:
                 if adv_opt is not None:
                     for _ in range(args.adv_steps - 1):
                         la = ce(adversary(h.detach(), 1.0), y)
-                        adv_opt.zero_grad(); la.backward(); adv_opt.step()
+                        adv_opt.zero_grad(); la.backward()
+                        torch.nn.utils.clip_grad_norm_(adversary.parameters(),
+                                                       args.clip_grad)
+                        adv_opt.step()
                 logits = adversary(h, lam)                      # GRL flips enc. gradient
                 loss_adv = ce(logits, y)
                 loss = loss + loss_adv
                 loss_adv_val = loss_adv.item()
                 adv_acc = (logits.argmax(1) == y).float().mean().item()
 
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            # Clip before stepping. The reversed adversary gradient is the one
+            # that blew up the v4 run (adversary loss 1.31 -> 1476.9 over five
+            # epochs), and with no clip anywhere each step made the next one
+            # larger. A finite ceiling breaks that runaway even if the
+            # adversary misbehaves.
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            opt.step()
+            ep_gnorm += float(gn)
+            ep_rank += effective_rank(h)
+            ep_hnorm += float(h.detach().norm(dim=1).mean())
             ep_loss += loss.item(); ep_con += loss_con.item()
             ep_adv += loss_adv_val; ep_adv_acc += adv_acc; ep_endmt += endmt_val
             nb += 1; step += 1
@@ -508,12 +536,17 @@ def main() -> None:
                     m["endmt/step_loss"] = endmt_val
                 _wandb_log(wandb_run, m, step)
 
+        ep_gnorm /= max(1, nb); ep_rank /= max(1, nb); ep_hnorm /= max(1, nb)
         ep_loss /= max(1, nb); ep_con /= max(1, nb)
         ep_adv /= max(1, nb); ep_adv_acc /= max(1, nb); ep_endmt /= max(1, nb)
         rec = {"epoch": epoch, "loss": ep_loss, "con_loss": ep_con,
-               "lr": lr_at(step), "elapsed_min": round((time.time() - t0) / 60, 2)}
+               "lr": lr_at(step), "elapsed_min": round((time.time() - t0) / 60, 2),
+               "eff_rank": round(ep_rank, 2), "h_norm": round(ep_hnorm, 3),
+               "grad_norm": round(ep_gnorm, 3)}
         wm = {"train/loss": ep_loss, "train/con_loss": ep_con,
-              "train/lr": lr_at(step), "epoch": epoch}
+              "train/lr": lr_at(step), "epoch": epoch,
+              "health/eff_rank": ep_rank, "health/h_norm": ep_hnorm,
+              "health/grad_norm": ep_gnorm}
         extra = ""
         if adversary is not None:
             rec.update({"adv_loss": ep_adv, "adv_acc": ep_adv_acc, "lambda": lambda_at(step)})
@@ -534,16 +567,34 @@ def main() -> None:
                     "config": {"in_dim": in_dim, "hidden_dim": args.hidden_dim,
                                "emb_dim": args.emb_dim, "heads": args.heads,
                                "edge_dim": 4, "dropout": args.dropout,
+                               "embed_norm": not args.no_embed_norm,
                                "batch_norm_features": args.batch_norm_features,
                                "adv_target": args.adv_target if args.adversarial else None,
                                "intensity_jitter": args.intensity_jitter},
                     "epoch": epoch, "loss": ep_loss},
                    stage3 / "encoder.pt")
 
-        # Track the best-scrubbed epoch: adversary accuracy closest to chance.
-        # Only consider epochs where lambda has substantially ramped, otherwise an
-        # early epoch wins simply because the adversary hasn't learned yet.
-        if adversary is not None and lambda_at(step) >= 0.5 * args.adv_lambda_max:
+        # Collapse guard. Dimensional collapse is silent everywhere else, so
+        # check it here while the run is still salvageable instead of
+        # discovering it in the embeddings months later.
+        if not np.isnan(ep_rank) and ep_rank < 0.05 * args.emb_dim:
+            print(f"  [!] effective rank {ep_rank:.2f} of {args.emb_dim} — the "
+                  f"embedding is collapsing to a line. Lower --adv-lambda-max, "
+                  f"lower --clip-grad, or drop --adversarial to confirm the "
+                  f"adversary is the cause.")
+
+        # Track the best epoch. Adversary accuracy ALONE is not a safe
+        # criterion: a diverged adversary predicts at chance, so scoring only
+        # on |acc - chance| rewards the very collapse it should catch. That is
+        # how v4's best checkpoint came to be a broken encoder. An epoch now
+        # qualifies only if the representation is still healthy - using a
+        # reasonable share of its dimensions, with a finite embedding norm -
+        # and scrubbing is used to rank the epochs that pass.
+        healthy = (not np.isnan(ep_rank)
+                   and ep_rank >= args.min_rank_frac * args.emb_dim
+                   and ep_hnorm < args.max_h_norm)
+        if (adversary is not None and healthy
+                and lambda_at(step) >= 0.5 * args.adv_lambda_max):
             scrub = abs(ep_adv_acc - adv_chance)
             if scrub < best_scrub:
                 best_scrub = scrub
@@ -551,6 +602,7 @@ def main() -> None:
                             "config": {"in_dim": in_dim, "hidden_dim": args.hidden_dim,
                                        "emb_dim": args.emb_dim, "heads": args.heads,
                                        "edge_dim": 4, "dropout": args.dropout,
+                               "embed_norm": not args.no_embed_norm,
                                        "batch_norm_features": args.batch_norm_features,
                                        "adv_target": args.adv_target,
                                        "intensity_jitter": args.intensity_jitter},
@@ -558,6 +610,17 @@ def main() -> None:
                            stage3 / "encoder_best.pt")
                 print(f"    ^ best scrub so far (adv_acc={ep_adv_acc:.3f} "
                       f"vs chance {adv_chance:.3f}) -> encoder_best.pt")
+
+    if adversary is not None:
+        if best_scrub == float("inf"):
+            print("\n[!] No epoch passed the health check, so encoder_best.pt was "
+                  "NOT written — every epoch either collapsed or diverged. Use "
+                  "encoder.pt (last epoch) only after checking it with "
+                  "check_embedding_health.py, and consider a lower "
+                  "--adv-lambda-max or a lower --min-rank-frac.")
+        else:
+            print(f"\n[ok] encoder_best.pt saved from a healthy epoch "
+                  f"(|adv_acc - chance| = {best_scrub:.4f})")
 
     print(f"\nDone. Encoder -> {stage3 / 'encoder.pt'}")
     if wandb_run is not None:

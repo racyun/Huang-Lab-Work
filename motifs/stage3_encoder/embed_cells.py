@@ -81,6 +81,10 @@ def load_encoder(ckpt_path: Path, device) -> NeighborhoodEncoder:
     model = NeighborhoodEncoder(
         in_dim=cfg["in_dim"], hidden_dim=cfg["hidden_dim"], emb_dim=cfg["emb_dim"],
         heads=cfg["heads"], edge_dim=cfg["edge_dim"], dropout=cfg["dropout"],
+        # Checkpoints predating the LayerNorm record no embed_norm. Defaulting
+        # to False reproduces those runs exactly instead of silently changing
+        # the architecture under an old state_dict (which would fail to load).
+        embed_norm=cfg.get("embed_norm", False),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
