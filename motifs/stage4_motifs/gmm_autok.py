@@ -502,19 +502,30 @@ def assign_all(X, keys, k, cov_type, reg, seed, out_dir, master_table):
         print(f"    motif {m:>2}: {sizes[m]:>9,} cells ({100 * sizes[m] / len(motif):5.2f}%)")
 
     if master_table and Path(master_table).exists():
-        mt = pd.read_csv(master_table)
-        if len(mt) == len(out):
-            cols = [c for c in FEATURE_COLS if c in mt.columns]
-            prof = mt[cols].copy()
-            prof["motif"] = motif
-            summ = prof.groupby("motif").mean()
-            summ.insert(0, "n_cells", prof.groupby("motif").size())
-            summ.insert(1, "pct_of_cells", 100 * summ["n_cells"] / len(prof))
-            summ.to_csv(out_dir / "motif_summary.csv")
-            print("\nPer-motif feature profile:")
-            print(summ.round(3).to_string())
+        # Merge on the real key rather than row order: image_id alone is NOT
+        # unique (the same tile name appears under every condition), and a
+        # --dates/--conditions filter makes the row counts differ anyway.
+        key = ["condition", "image_id", "cell_id"]
+        mt = pd.read_csv(master_table, dtype={"image_id": str})
+        cols = [c for c in FEATURE_COLS if c in mt.columns]
+        if not set(key).issubset(mt.columns):
+            print(f"  [skip] master table lacks {key}; cannot join feature profile")
         else:
-            print(f"  [skip] master table has {len(mt)} rows, embeddings {len(out)}")
+            prof = out.merge(mt[key + cols], on=key, how="left", validate="one_to_one")
+            matched = int(prof[cols].notna().any(axis=1).sum())
+            if matched == 0:
+                print("  [skip] no rows matched the master table on "
+                      f"{key} — feature profile unavailable")
+            else:
+                if matched < len(prof):
+                    print(f"  [warn] {len(prof) - matched:,} of {len(prof):,} cells "
+                          "did not match the master table; profiled the rest")
+                summ = prof.groupby("motif")[cols].mean()
+                summ.insert(0, "n_cells", prof.groupby("motif").size())
+                summ.insert(1, "pct_of_cells", 100 * summ["n_cells"] / len(prof))
+                summ.to_csv(out_dir / "motif_summary.csv")
+                print("\nPer-motif feature profile:")
+                print(summ.round(3).to_string())
     return motif
 
 
@@ -567,6 +578,13 @@ def main() -> None:
                          "and is the safer default at this sample size")
     ap.add_argument("--reg-covar", type=float, default=1e-5,
                     help="ridge added to covariance diagonals; raise if fits fail")
+    ap.add_argument("--dates", default=None, metavar="D[,D...]",
+                    help="keep only cells imaged on these dates (the 6-digit "
+                         "prefix of `condition`). '--dates 260516' restricts to "
+                         "the one session holding two stiffnesses, giving a "
+                         "date-matched comparison with no confound to correct.")
+    ap.add_argument("--conditions", default=None, metavar="C[,C...]",
+                    help="keep only these exact conditions")
     ap.add_argument("--pca", type=int, default=0, metavar="N",
                     help="truncate to the top N principal components before "
                          "fitting. The encoder's 64 dims come from 7 input "
@@ -594,6 +612,31 @@ def main() -> None:
         print(f"  covariance : {args.covariance_type}   reg_covar={args.reg_covar}")
 
         edf = load_embeddings(args.embeddings)
+        n_all = len(edf)
+
+        # Restrict BEFORE fitting, so the mixture components are defined by the
+        # retained cells only. Filtering afterwards would describe the full
+        # population's structure on a subset of it.
+        if args.dates:
+            want = [d.strip() for d in args.dates.split(",") if d.strip()]
+            edf = edf[edf["condition"].str[:6].isin(want)]
+            print(f"\n  --dates {','.join(want)}: kept {len(edf):,} of "
+                  f"{n_all:,} cells")
+        if args.conditions:
+            want = [c.strip() for c in args.conditions.split(",") if c.strip()]
+            edf = edf[edf["condition"].isin(want)]
+            print(f"  --conditions: kept {len(edf):,} of {n_all:,} cells")
+        if args.dates or args.conditions:
+            if edf.empty:
+                raise SystemExit("[error] no cells left after filtering — check "
+                                 "--dates/--conditions against the embedding")
+            edf = edf.reset_index(drop=True)
+            present = sorted(edf["condition"].unique())
+            print(f"  conditions retained ({len(present)}): {', '.join(present)}")
+            if len(present) < 2:
+                print("  [warn] only one condition retained — there is no "
+                      "contrast left to compare motif frequencies across")
+
         cols = [c for c in edf.columns if c.startswith("emb_")]
         X = np.ascontiguousarray(edf[cols].to_numpy(dtype=np.float32))
         keys = edf[["condition", "image_id", "cell_id"]].copy()

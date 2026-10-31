@@ -87,7 +87,35 @@ def push_file_to_drive(local: Path, drive_subpath: str = "") -> None:
         raise RuntimeError(f"rclone copyto failed (exit {r.returncode})")
 
 
-def assemble(metadata_dir: Path, out_dir: Path, push_to_drive: bool = False) -> pd.DataFrame:
+def _zscore_groups(master: pd.DataFrame, scope: str) -> tuple[pd.Series, str]:
+    """Return the grouping key for intensity z-scoring, and a label for it.
+
+    'global' pools every cell, which lets session-to-session staining and
+    illumination differences pass into the node features. Because imaging date
+    is nearly collinear with substrate stiffness in this dataset, that leak is
+    indistinguishable from the biological effect downstream.
+
+    'date' centres each imaging session separately. It removes exactly the
+    nuisance variable and keeps every within-session difference — including the
+    one date-matched stiffness contrast the design supports (5kPa vs 500kPa,
+    both imaged on 260516). Conditions that appear on a single date become
+    mutually incomparable by construction, which is honest: those comparisons
+    carried no separable information to begin with.
+
+    'image' centres each tile. Most aggressive; also discards real signal when
+    a tile is genuinely uniform, so it is a robustness check, not a default.
+    """
+    if scope == "global":
+        return pd.Series(np.zeros(len(master), dtype=int), index=master.index), "all cells"
+    if scope == "date":
+        return master["condition"].str[:6], "imaging date"
+    if scope == "image":
+        return master["condition"] + "/" + master["image_id"], "image"
+    raise ValueError(f"unknown zscore scope: {scope}")
+
+
+def assemble(metadata_dir: Path, out_dir: Path, push_to_drive: bool = False,
+             zscore_scope: str = "global") -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     entries = discover_csvs(metadata_dir)
     if not entries:
@@ -107,22 +135,43 @@ def assemble(metadata_dir: Path, out_dir: Path, push_to_drive: bool = False) -> 
     print(f"Concatenated {len(master)} cells from {master['image_id'].nunique()} "
           f"image(s) across {master['condition'].nunique()} condition(s)")
 
-    stats: dict = {"zscore": {}, "endmt_median": None, "n_cells": int(len(master))}
+    stats: dict = {"zscore": {}, "endmt_median": None, "n_cells": int(len(master)),
+                   "zscore_scope": zscore_scope}
 
-    # ----- global z-score (NaN-aware): (x - mean) / std, then NaN -> 0 (the mean) -----
+    # ----- z-score (NaN-aware): (x - mean) / std, then NaN -> 0 (the mean) -----
+    groups, scope_label = _zscore_groups(master, zscore_scope)
+    n_groups = int(groups.nunique())
+    print(f"\n  z-scoring intensities within: {scope_label}  ({n_groups} group(s))")
+    if zscore_scope == "global" and master["condition"].str[:6].nunique() > 1:
+        print("  [warn] global scope leaves session staining/illumination "
+              "differences in the features; --zscore-scope date removes them")
+
     for col in ZSCORE_COLS:
         if col not in master.columns:
             print(f"  [warn] expected feature column missing: {col}")
             continue
         vals = master[col].to_numpy(dtype=float)
-        mean = float(np.nanmean(vals))
-        std = float(np.nanstd(vals))  # population std (ddof=0)
-        std_safe = std if std > 1e-12 else 1.0
-        z = (vals - mean) / std_safe
+        z = np.full(len(vals), np.nan)
+        per_group = {}
+        for g, idx in groups.groupby(groups).groups.items():
+            pos = master.index.get_indexer(idx)
+            gv = vals[pos]
+            mean = float(np.nanmean(gv)) if np.isfinite(np.nanmean(gv)) else 0.0
+            std = float(np.nanstd(gv))  # population std (ddof=0)
+            std_safe = std if std > 1e-12 else 1.0
+            z[pos] = (gv - mean) / std_safe
+            per_group[str(g)] = {"mean": mean, "std": std, "n": int(len(gv))}
         z[np.isnan(z)] = 0.0
         master[col] = z
-        stats["zscore"][col] = {"mean": mean, "std": std}
-        print(f"  z-scored {col:<40} mean={mean:.4g} std={std:.4g}")
+        stats["zscore"][col] = (per_group["0"] if zscore_scope == "global"
+                                else {"scope": zscore_scope, "groups": per_group})
+        means = [v["mean"] for v in per_group.values()]
+        if n_groups == 1:
+            print(f"  z-scored {col:<40} mean={means[0]:.4g} "
+                  f"std={per_group['0']['std']:.4g}")
+        else:
+            print(f"  z-scored {col:<40} group means {min(means):.4g}..{max(means):.4g} "
+                  f"(spread {max(means) - min(means):.4g} removed)")
 
     # ----- endmt_score: keep raw [0,1], impute NaN with global median -----
     if "endmt_score" in master.columns:
@@ -158,10 +207,19 @@ def main() -> None:
                     help="dir holding <condition>/<name>_metadata.csv (default: %(default)s)")
     ap.add_argument("--out-dir", type=Path, default=root,
                     help="where to write master_table.csv (default: %(default)s)")
+    ap.add_argument("--zscore-scope", choices=["global", "date", "image"],
+                    default="global",
+                    help="group within which to z-score intensities. 'global' "
+                         "(default, matches earlier runs) leaves session "
+                         "staining/illumination differences in the features; "
+                         "'date' removes them while keeping every within-"
+                         "session contrast; 'image' is a stricter robustness "
+                         "check. (default: %(default)s)")
     ap.add_argument("--push-to-drive", action="store_true",
                     help="rclone-copy master_table.csv + stats up to gdrive: when done")
     args = ap.parse_args()
-    assemble(args.metadata_dir, args.out_dir, push_to_drive=args.push_to_drive)
+    assemble(args.metadata_dir, args.out_dir, push_to_drive=args.push_to_drive,
+             zscore_scope=args.zscore_scope)
 
 
 if __name__ == "__main__":
