@@ -518,6 +518,35 @@ def assign_all(X, keys, k, cov_type, reg, seed, out_dir, master_table):
     return motif
 
 
+def _cond(X: np.ndarray) -> float:
+    """Condition number of the covariance spectrum."""
+    ev = np.linalg.svd(X - X.mean(0), compute_uv=False) ** 2
+    ev = ev[ev > 0]
+    return float(ev[0] / ev[-1]) if len(ev) else float("nan")
+
+
+def pca_truncate(X: np.ndarray, n: int, seed: int) -> np.ndarray:
+    """Project onto the top n principal components.
+
+    Not whitened on purpose: whitening would rescale the near-zero trailing
+    components up to parity with the leading ones, which amplifies noise into
+    signal. Truncation alone is what fixes the conditioning.
+    """
+    from sklearn.decomposition import PCA
+
+    n = min(n, X.shape[1])
+    rng = np.random.default_rng(seed)
+    sub = X if len(X) <= 200_000 else X[rng.choice(len(X), 200_000, replace=False)]
+    p = PCA(n_components=n, random_state=seed).fit(sub)
+    Xp = np.ascontiguousarray(p.transform(X), dtype=np.float32)
+    kept = float(p.explained_variance_ratio_.sum())
+    print(f"  PCA {X.shape[1]} -> {n} dims   variance kept {kept:.4f}")
+    print(f"  condition number {_cond(X):.2e} -> {_cond(Xp):.2e}")
+    if kept < 0.95:
+        print(f"  [warn] only {kept:.1%} of variance kept — raise --pca")
+    return Xp
+
+
 def main() -> None:
     root = _default_local_root()
     ap = argparse.ArgumentParser(
@@ -538,6 +567,13 @@ def main() -> None:
                          "and is the safer default at this sample size")
     ap.add_argument("--reg-covar", type=float, default=1e-5,
                     help="ridge added to covariance diagonals; raise if fits fail")
+    ap.add_argument("--pca", type=int, default=0, metavar="N",
+                    help="truncate to the top N principal components before "
+                         "fitting. The encoder's 64 dims come from 7 input "
+                         "features, so most carry no variance and leave the "
+                         "covariance near-singular; N around the '99%% of "
+                         "variance' figure from check_embedding_health.py "
+                         "removes that without discarding signal. 0 = off.")
     ap.add_argument("--jobs", type=int, default=-1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--assign", action="store_true",
@@ -562,6 +598,9 @@ def main() -> None:
         X = np.ascontiguousarray(edf[cols].to_numpy(dtype=np.float32))
         keys = edf[["condition", "image_id", "cell_id"]].copy()
         print(f"\nLoaded {len(X):,} cells x {len(cols)} dims")
+
+        if args.pca > 0:
+            X = pca_truncate(X, args.pca, args.seed)
 
         k_values = list(range(args.k_min, args.k_max + 1))
         print(f"\nSweeping k = {k_values[0]}..{k_values[-1]}")
