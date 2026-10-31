@@ -159,8 +159,17 @@ def main() -> None:
         print(f"\n{'=' * 74}\nDESIGN — which dates each stiffness was imaged on")
         dt = design_table(df)
         print(dt.to_string())
+        n_dates_total = df["date"].nunique()
         single = dt[dt["n_dates"] == 1].index.tolist()
-        if single:
+        if n_dates_total == 1:
+            # Every cell comes from one session, so date cannot vary with
+            # anything. A per-stiffness "only one date" count is trivially true
+            # here and must not be read as a confound.
+            print(f"\n  [ok] all cells come from a single session "
+                  f"({df['date'].iloc[0]}). Date is constant,\n       so no "
+                  "date/stiffness confound is possible within this subset — "
+                  "every\n       contrast below is date-matched by construction.")
+        elif single:
             print(f"\n  [!] {len(single)} of {len(dt)} stiffness levels were imaged on a "
                   "single date:")
             print(f"      {', '.join(single)}")
@@ -218,11 +227,15 @@ def main() -> None:
             print("  none — no stiffness was imaged twice, so the batch effect "
                   "cannot be\n  measured from this data at all.")
 
-        print(f"\n{'=' * 74}\nFOR SCALE — fully confounded across-date range")
+        clean = n_dates_total == 1
+        label = ("FOR SCALE — stiffness range (single session: date-matched)"
+                 if clean else
+                 "FOR SCALE — fully confounded across-date range")
+        print(f"\n{'=' * 74}\n{label}")
         by_s = pos.groupby("stiffness")["frac"].mean().sort_values()
         print(by_s.round(4).to_string())
-        print(f"  max - min = {by_s.max() - by_s.min():+.4f}  "
-              "(NOT interpretable as a stiffness effect)")
+        note = ("" if clean else "  (NOT interpretable as a stiffness effect)")
+        print(f"  max - min = {by_s.max() - by_s.min():+.4f}{note}")
 
         print(f"\nWrote {out_dir / 'design_table.csv'}")
         print(f"Wrote {out_dir / 'position_fractions.csv'}")
