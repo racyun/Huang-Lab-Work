@@ -299,10 +299,13 @@ def main() -> None:
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--min-rank-frac", type=float, default=0.15,
-                    help="an epoch counts as healthy only if its embedding uses at "
-                         "least this fraction of emb_dim. Guards the best-checkpoint "
-                         "rule against saving a collapsed encoder.")
+    ap.add_argument("--min-rank-frac", type=float, default=0.5,
+                    help="an epoch counts as healthy only if its embedding's effective "
+                         "rank is at least this fraction of min(emb_dim, in_dim). The "
+                         "reference is the INPUT width, not emb_dim: with 7 node "
+                         "features a neighbourhood carries about 7 dimensions of "
+                         "information, so a 64-d embedding can never be full rank and "
+                         "a threshold scaled to emb_dim is unreachable by construction.")
     ap.add_argument("--max-h-norm", type=float, default=1e3,
                     help="embedding norm above which an epoch is treated as diverged")
     ap.add_argument("--clip-grad", type=float, default=5.0,
@@ -457,6 +460,11 @@ def main() -> None:
     mse = torch.nn.MSELoss()
     best_scrub = float("inf")          # |adv_acc - chance|, lower = better scrubbed
     adv_chance = 1.0 / max(1, len(ds.conditions))
+    # Effective rank is bounded by the information actually entering the model,
+    # so scale the health floor to min(emb_dim, in_dim) rather than emb_dim.
+    min_rank = max(2.0, args.min_rank_frac * min(args.emb_dim, in_dim))
+    print(f"  health floor: effective rank >= {min_rank:.1f} "
+          f"(in_dim={in_dim}, emb_dim={args.emb_dim})")
     step = 0
     t0 = time.time()
     for epoch in range(args.epochs):
@@ -577,8 +585,8 @@ def main() -> None:
         # Collapse guard. Dimensional collapse is silent everywhere else, so
         # check it here while the run is still salvageable instead of
         # discovering it in the embeddings months later.
-        if not np.isnan(ep_rank) and ep_rank < 0.05 * args.emb_dim:
-            print(f"  [!] effective rank {ep_rank:.2f} of {args.emb_dim} — the "
+        if not np.isnan(ep_rank) and ep_rank < 0.5 * min_rank:
+            print(f"  [!] effective rank {ep_rank:.2f} (floor {min_rank:.1f}) — the "
                   f"embedding is collapsing to a line. Lower --adv-lambda-max, "
                   f"lower --clip-grad, or drop --adversarial to confirm the "
                   f"adversary is the cause.")
@@ -590,8 +598,7 @@ def main() -> None:
         # qualifies only if the representation is still healthy - using a
         # reasonable share of its dimensions, with a finite embedding norm -
         # and scrubbing is used to rank the epochs that pass.
-        healthy = (not np.isnan(ep_rank)
-                   and ep_rank >= args.min_rank_frac * args.emb_dim
+        healthy = (not np.isnan(ep_rank) and ep_rank >= min_rank
                    and ep_hnorm < args.max_h_norm)
         if (adversary is not None and healthy
                 and lambda_at(step) >= 0.5 * args.adv_lambda_max):
