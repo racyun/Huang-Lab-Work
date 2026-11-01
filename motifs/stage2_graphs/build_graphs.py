@@ -79,9 +79,52 @@ def _default_local_root() -> Path:
     return Path.home() / "cellpose_work"
 
 
+BRIGHTNESS_COLS = [
+    "ch1_cellwise_mean_intensity",
+    "ch2_cellwise_mean_membrane_intensity",
+    "ch3_cellwise_mean_intensity",
+]
+
+
+def balanced_feature_weights(master: pd.DataFrame) -> dict[str, float]:
+    """Per-feature multipliers that give each *concept* equal influence.
+
+    A feature's influence on any distance-based model goes as the square of its
+    spread, so two imbalances were hiding in the default features:
+
+    1. ZSCORE_COLS were rescaled to spread 1.0 while endmt_score was left in
+       its raw 0-1 range (spread ~0.255). Squared, that is ~15x less influence:
+       measured on the real table, endmt_score contributed 1.3% of total
+       variance against 19.7% for each of the others. The one feature carrying
+       the biology was effectively invisible.
+    2. The three brightness channels each counted as a full feature, so
+       brightness held ~59% of the total between them.
+
+    This returns weights that undo both: every feature is scaled to unit
+    spread, then the three brightness channels are scaled by 1/sqrt(3) so the
+    group contributes one feature's worth in total. The result is 25% each for
+    area, shape, EndMT and brightness-as-a-whole.
+
+    The channels are weighted rather than merged on purpose — measured
+    correlations between them are only 0.07-0.23, so they carry different
+    information and collapsing them would discard signal.
+    """
+    weights: dict[str, float] = {}
+    for col in ZSCORE_COLS + RAW_COLS:
+        if col not in master.columns:
+            continue
+        sd = float(np.nanstd(master[col].to_numpy(dtype=float)))
+        w = 1.0 / sd if sd > 1e-12 else 1.0
+        if col in BRIGHTNESS_COLS:
+            w /= np.sqrt(len(BRIGHTNESS_COLS))
+        weights[col] = w
+    return weights
+
+
 def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float,
                 image_w: float | None = None, image_h: float | None = None,
-                edge_rule: str = "knn", radius_mult: float = 1.5):
+                edge_rule: str = "knn", radius_mult: float = 1.5,
+                feature_weights: dict[str, float] | None = None):
     """Build one PyG Data from a single image's rows. Returns (data, qc_dict).
 
     edge_rule picks the candidate edges before the d_max prune:
@@ -201,8 +244,13 @@ def build_graph(df_image: pd.DataFrame, k: int, d_max_mult: float,
     qc["n_on_border"] = int(on_border.sum())
 
     # ----- node feature matrix x (doc §0 ordering) -----
-    feats = [df_image[c].to_numpy(dtype=float) for c in ZSCORE_COLS + RAW_COLS]
-    feats.append(on_border)
+    feats = []
+    for c in ZSCORE_COLS + RAW_COLS:
+        v = df_image[c].to_numpy(dtype=float)
+        if feature_weights:
+            v = v * feature_weights.get(c, 1.0)
+        feats.append(v)
+    feats.append(on_border)   # a 0/1 flag; scaling it would be meaningless
     x = torch.tensor(np.stack(feats, axis=1), dtype=torch.float)
     pos = torch.tensor(pos_np, dtype=torch.float)
 
@@ -293,6 +341,13 @@ def main() -> None:
                     help="square image side in px for on_border; 0 = use centroid "
                          "bounding box instead (default: 682)")
     ap.add_argument("--overlays-per-condition", type=int, default=5)
+    ap.add_argument("--balance-features", action="store_true",
+                    help="give each concept equal influence: scale every "
+                         "feature to unit spread, then scale the three "
+                         "brightness channels by 1/sqrt(3) so they count as "
+                         "one feature in total. Without this, brightness holds "
+                         "~59%% of the input variance and endmt_score only "
+                         "1.3%%. Off by default so v1-v5 reproduce.")
     ap.add_argument("--push-to-drive", action="store_true",
                     help="rclone-copy graphs/, graph_qc.csv, graph_overlays/ up to gdrive: when done")
     args = ap.parse_args()
@@ -315,6 +370,31 @@ def main() -> None:
     with open(graphs_dir / "feature_names.json", "w") as f:
         json.dump(NODE_FEATURE_NAMES, f, indent=2)
 
+    feature_weights = None
+    if args.balance_features:
+        feature_weights = balanced_feature_weights(master)
+        print("\nFeature weights (--balance-features):")
+        raw_var, new_var = {}, {}
+        for c in ZSCORE_COLS + RAW_COLS:
+            if c not in master.columns:
+                continue
+            sd = float(np.nanstd(master[c].to_numpy(dtype=float)))
+            raw_var[c] = sd ** 2
+            new_var[c] = (sd * feature_weights[c]) ** 2
+        rt, nt = sum(raw_var.values()), sum(new_var.values())
+        for c in ZSCORE_COLS + RAW_COLS:
+            if c not in raw_var:
+                continue
+            print(f"  {c:40s} x{feature_weights[c]:6.3f}   "
+                  f"share {100 * raw_var[c] / rt:5.1f}% -> "
+                  f"{100 * new_var[c] / nt:5.1f}%")
+        bright = sum(new_var[c] for c in BRIGHTNESS_COLS if c in new_var)
+        was = sum(raw_var[c] for c in BRIGHTNESS_COLS if c in raw_var)
+        print(f"  {'brightness channels combined':40s}          "
+              f"share {100 * was / rt:5.1f}% -> {100 * bright / nt:5.1f}%")
+        with open(graphs_dir / "feature_weights.json", "w") as f:
+            json.dump(feature_weights, f, indent=2)
+
     qc_rows = []
     overlay_counts: dict[str, int] = {}
     n_graphs = 0
@@ -324,7 +404,8 @@ def main() -> None:
     for (condition, image_id), df_img in master.groupby(["condition", "image_id"], sort=True):
         data, qc = build_graph(df_img, k=args.k, d_max_mult=args.d_max_mult,
                                image_w=img_dim, image_h=img_dim,
-                               edge_rule=args.edge_rule, radius_mult=args.radius_mult)
+                               edge_rule=args.edge_rule, radius_mult=args.radius_mult,
+                               feature_weights=feature_weights)
         qc["edge_rule"] = args.edge_rule
         cond_dir = graphs_dir / condition
         cond_dir.mkdir(parents=True, exist_ok=True)
