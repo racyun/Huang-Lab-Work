@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
-"""Quantify and draw the EndMT distribution on the one date-matched session.
+"""Gradient or clusters, how wide, and where — EndMT on the date-matched pair.
 
-Restricted to 260516, the only session holding two stiffnesses, so no imaging
-session difference can enter. The readout is TAGLN divided by the same cell's
-DAPI, which is the only readout that survived the same-biology control in
-marker_ratio_stats.py.
+Restricted to 260516, the only session holding two stiffnesses. Readout is the
+Stage 1 ``endmt_score`` = TAGLN / (TAGLN + VE-cadherin), background-subtracted,
+in [0, 1]. Three corrections are applied before anything is measured:
 
-Answers two questions that "are there motifs?" does not:
+  imputed   Stage 2 fills cells with no valid score with the global median.
+            Those are a spike at one exact value, not measurements; dropped.
+  clamped   Stage 1 clamps a marker below background to zero, which pins the
+            score to exactly 0 or exactly 1. These pile-ups are what make a
+            raw dip test reject "one peak"; shape tests exclude them, and
+            their share is reported because it differs a lot by condition.
+  size      The score falls with cell area (r ~ -0.42 within condition) and
+            soft cells are ~2.4x smaller. Soft-vs-stiff contrasts are
+            therefore also reported between cells of matched size.
 
-  HOW MUCH does the population spread, and does the spread differ by substrate
-  WHERE does the extra signal come from — every cell shifting up together, or a
-  growing tail of high-expressing cells
+Questions answered, each with numbers:
 
-The second is read off the quantile ratios. A constant ratio across percentiles
-means the whole population moved; a ratio that climbs with percentile means a
-sub-population is driving the mean.
+  A  Is the score one continuous range, or separate groups?   (dip test)
+  B  How wide is the range, and how does it differ by substrate?
+  C  Within a tile, do similar cells sit together, how far does that
+     similarity reach, and do high-EndMT cells favour crowded or sparse
+     spots?  (Moran's I against a shuffle null; pair correlation by distance)
+  D  Across a whole 3x3 field, are there broader patches, and how much of
+     that is a fixed imaging pattern rather than the cells?
 
-Spatial maps reassemble each imaging position from its 3x3 grid of tiles.
-Centroids are stored per tile in a 0..~681 frame, so tile r#c# is offset by
-(c-1, r-1) tile widths. Positions shown are the ones closest to their own
-condition's median, not the most striking ones.
+Earlier versions of this script plotted TAGLN/DAPI. That readout was built on
+a swapped channel assignment and, once fixed, measured cell size; it is gone.
 
 Usage
 -----
@@ -31,7 +38,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,13 +45,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# ch1 is DAPI and ch3 is TAGLN: the chN names follow CH numbering, which is
-# the reverse of the RGB plane order used in Stage 1.
-DAPI = "ch1_cellwise_mean_intensity"
-TAGLN = "ch3_cellwise_mean_intensity"
 DATE = "260516"
 TILE = 681.0                      # tile frame width, from the centroid range
-QUANTILES = [5, 10, 25, 50, 75, 90, 95, 99]
+K = 8                             # neighbours for Moran's I
+N_PERM = 49                       # shuffles per tile for the Moran null
+CROWD_RADIUS = 60.0               # px, for the local-density count
+DIST_BINS = [0, 25, 50, 75, 100, 150, 200, 300, 450]
+QUANTILES = [5, 10, 25, 50, 75, 90, 95]
+SOFT, STIFF = "5kPa", "500kPa"
+C_SOFT, C_STIFF = "#c0392b", "#2471a3"
 
 
 class _Tee:
@@ -74,133 +82,294 @@ def _default_local_root() -> Path:
     return Path.home() / "cellpose_work"
 
 
+# --------------------------------------------------------------------- data
 def load(master: Path, stats_path: Path) -> pd.DataFrame:
     stats = json.load(open(stats_path))
-    scope = stats.get("zscore_scope") or "global"
-    if scope != "global":
-        raise SystemExit(f"[error] z-scoring scope is '{scope}'; raw intensities "
-                         "are only recoverable from a global table")
-    z = stats["zscore"]
+    if (stats.get("zscore_scope") or "global") != "global":
+        raise SystemExit("[error] cell area can only be recovered from a "
+                         "globally z-scored table")
+    za, med = stats["zscore"]["area_px"], stats.get("endmt_median")
+
     df = pd.read_csv(master, usecols=["condition", "image_id", "cell_id",
-                                      "centroid_x", "centroid_y",
-                                      "endmt_score", TAGLN, DAPI])
-    for c in (TAGLN, DAPI):
-        df[c] = df[c] * z[c]["std"] + z[c]["mean"]
-    df = df[df.condition.str.startswith(DATE) & (df[DAPI] >= 1.0)].copy()
-    df["value"] = df[TAGLN] / df[DAPI]
-    n_bad = int((df["value"] <= 0).sum())
-    if n_bad:
-        print(f"  [note] dropped {n_bad} cell(s) with non-positive TAGLN "
-              f"({100 * n_bad / len(df):.2f}%)")
-        df = df[df["value"] > 0].copy()
+                                      "area_px", "centroid_x", "centroid_y",
+                                      "endmt_score"])
+    df = df[df.condition.str.startswith(DATE)].copy()
+    df["area_px"] = df["area_px"] * za["std"] + za["mean"]
     df["stiff"] = df["condition"].str.split("_").str[1]
+
+    n0 = len(df)
+    if med is not None:
+        df = df[df["endmt_score"] != med]
+    print(f"  dropped {n0 - len(df):,} imputed cells (score == stored median "
+          f"{med:.4f})")
+    df = df[df["area_px"] > 0].copy()
+
+    df["clamped"] = df["endmt_score"].isin([0.0, 1.0])
+    df["log_area"] = np.log(df["area_px"])
+
     parts = df["image_id"].str.extract(r"^(?P<pos>.+?)_r(?P<r>\d+)c(?P<c>\d+)$")
     df["position"] = parts["pos"].fillna(df["image_id"])
-    df["grid_r"] = pd.to_numeric(parts["r"], errors="coerce").fillna(1).astype(int)
-    df["grid_c"] = pd.to_numeric(parts["c"], errors="coerce").fillna(1).astype(int)
-    df["field_x"] = df["centroid_x"] + (df["grid_c"] - 1) * TILE
-    df["field_y"] = df["centroid_y"] + (df["grid_r"] - 1) * TILE
+    df["field_x"] = df["centroid_x"] + (pd.to_numeric(parts["c"]).fillna(1) - 1) * TILE
+    df["field_y"] = df["centroid_y"] + (pd.to_numeric(parts["r"]).fillna(1) - 1) * TILE
+
+    # Within-condition size adjustment, re-centred on the condition mean. It
+    # removes size variation INSIDE a condition (for shape and spatial tests)
+    # and deliberately leaves the between-condition gap alone; that gap gets
+    # its own size-matched comparison.
+    df["endmt_sizeadj"] = np.nan
+    for _, g in df.groupby("stiff"):
+        b = np.polyfit(g["log_area"], g["endmt_score"], 1)
+        df.loc[g.index, "endmt_sizeadj"] = (g["endmt_score"]
+                                            - np.polyval(b, g["log_area"])
+                                            + g["endmt_score"].mean())
     return df
 
 
-def report_numbers(df: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
-    from scipy import stats as sps
+# ------------------------------------------------------------------ A and B
+def shape_and_spread(df: pd.DataFrame, out_dir: Path, rng) -> dict:
+    import diptest
 
-    soft = df[df.stiff == "5kPa"]["value"].to_numpy()
-    stiff = df[df.stiff == "500kPa"]["value"].to_numpy()
+    res: dict = {}
+    print(f"\n{'=' * 74}\nA  ONE CONTINUOUS RANGE, OR SEPARATE GROUPS?\n{'=' * 74}")
+    print("  share of cells pinned at exactly 0 or 1 by the background clamp:")
+    for s in (STIFF, SOFT):
+        v = df[df.stiff == s]["endmt_score"]
+        print(f"    {s:>7}: at 0 {np.mean(v == 0):5.1%}   at 1 {np.mean(v == 1):5.1%}")
 
-    print(f"\n{'=' * 72}\nHOW MUCH — spread within each substrate\n{'=' * 72}")
-    for name, v in (("500kPa (stiff)", stiff), ("5kPa (soft)", soft)):
-        print(f"  {name:<16} n={len(v):>7,}  mean={v.mean():6.3f}  "
-              f"median={np.median(v):6.3f}  CV={v.std() / v.mean():5.3f}  "
-              f"skew={sps.skew(v):+5.2f}")
+    print("\n  Hartigan dip test, null = one peak; 40 subsamples of 5,000,")
+    print("  clamped cells excluded:")
+    for s in (STIFF, SOFT):
+        v = df[(df.stiff == s) & ~df.clamped]["endmt_score"].to_numpy()
+        ps = np.array([diptest.diptest(rng.choice(v, 5000, replace=False))[1]
+                       for _ in range(40)])
+        verdict = "separate groups" if np.mean(ps < .05) > .5 else "one continuous range"
+        res[f"dip_p_{s}"] = float(np.median(ps))
+        print(f"    {s:>7}: median p={np.median(ps):.3f}, rejects one peak in "
+              f"{np.mean(ps < .05):.0%}  -> {verdict}")
 
-    print(f"\n{'=' * 72}\nWHERE — is it a uniform shift, or a growing tail?\n{'=' * 72}")
-    print(f"{'percentile':>11}{'500kPa':>10}{'5kPa':>10}{'ratio':>8}")
+    print(f"\n{'=' * 74}\nB  HOW WIDE, AND HOW DOES IT DIFFER BY SUBSTRATE?\n{'=' * 74}")
     rows = []
-    for q in QUANTILES:
-        a, b = float(np.percentile(stiff, q)), float(np.percentile(soft, q))
-        rows.append({"percentile": q, "stiff_500kPa": a, "soft_5kPa": b,
-                     "ratio": b / a})
-        print(f"{q:>10}%{a:>10.3f}{b:>10.3f}{b / a:>8.2f}")
-    tbl = pd.DataFrame(rows)
-    tbl.to_csv(out_dir / "quantile_table.csv", index=False)
+    hdr = "".join(f"{q:>7}%" for q in QUANTILES)
+    print(f"  {'':>8}{hdr}{'SD':>8}{'IQR':>8}{'>0.5':>8}")
+    for s in (STIFF, SOFT):
+        v = df[df.stiff == s]["endmt_score"].to_numpy()
+        p = np.percentile(v, QUANTILES)
+        iqr = float(np.percentile(v, 75) - np.percentile(v, 25))
+        rows.append({"stiffness": s, **{f"p{q}": float(x) for q, x in zip(QUANTILES, p)},
+                     "sd": float(v.std()), "iqr": iqr, "frac_above_0.5": float(np.mean(v > .5)),
+                     "n": len(v)})
+        print(f"  {s:>8}" + "".join(f"{x:>8.3f}" for x in p)
+              + f"{v.std():>8.3f}{iqr:>8.3f}{np.mean(v > .5):>8.1%}")
+    pd.DataFrame(rows).to_csv(out_dir / "spread_table.csv", index=False)
 
-    lo, hi = tbl.ratio.iloc[0], tbl.ratio.iloc[-1]
-    print(f"\n  ratio climbs {lo:.2f} -> {hi:.2f} from the 5th to the 99th "
-          "percentile.")
-    print("  The mean moves "
-          f"{soft.mean() / stiff.mean():.2f}x but the 99th percentile moves "
-          f"{hi:.2f}x, so the\n  increase is concentrated in a high-expressing "
-          "tail rather than applied\n  evenly to every cell. The bottom 5% is "
-          "actually LOWER on soft "
-          f"({lo:.2f}x):\n  the population spreads apart, it does not "
-          "translate.")
+    # soft minus stiff between cells of the same size
+    d = df.copy()
+    d["abin"] = pd.qcut(d["area_px"], 20, labels=False, duplicates="drop")
+    band = []
+    for b, g in d.groupby("abin"):
+        a = g[g.stiff == SOFT]["endmt_score"]
+        c = g[g.stiff == STIFF]["endmt_score"]
+        if len(a) > 100 and len(c) > 100:
+            band.append({"area_band": int(b), "median_area": float(g.area_px.median()),
+                         "soft": float(a.mean()), "stiff": float(c.mean()),
+                         "diff": float(a.mean() - c.mean()), "n": len(g)})
+    band = pd.DataFrame(band)
+    band.to_csv(out_dir / "size_matched_difference.csv", index=False)
+    raw = (df[df.stiff == SOFT]["endmt_score"].mean()
+           - df[df.stiff == STIFF]["endmt_score"].mean())
+    adj = float(np.average(band["diff"], weights=band["n"]))
+    res.update(raw_diff=float(raw), size_matched_diff=adj, band=band)
+    print(f"\n  soft minus stiff, mean score:")
+    print(f"    all cells             {raw:+.3f}")
+    print(f"    same-size cells only  {adj:+.3f}   ({adj / raw:.0%} of the raw gap; "
+          f"soft is higher in {np.mean(band['diff'] > 0):.0%} of {len(band)} size bands)")
+    print("  The rest of the raw gap is soft cells being smaller, and smaller cells "
+          "scoring\n  higher in both conditions.")
 
-    thr = float(np.percentile(stiff, 90))
-    fs, fh = float(np.mean(soft > thr)), float(np.mean(stiff > thr))
-    print(f"\n  cells above the stiff 90th percentile ({thr:.2f}):")
-    print(f"    500kPa {fh:.1%}   5kPa {fs:.1%}   -> {fs / fh:.1f}x as many")
-    return tbl
+    above = {s: float(np.mean(df[df.stiff == s]["endmt_score"] > .5)) for s in (STIFF, SOFT)}
+    res["above_half"] = above
+    print(f"\n  cells scoring above 0.5 (TAGLN signal exceeds VE-cadherin signal):")
+    print(f"    {STIFF} {above[STIFF]:.1%}   {SOFT} {above[SOFT]:.1%}   "
+          f"-> {above[SOFT] / above[STIFF]:.1f}x")
+    return res
 
 
-def plot_distribution(df: pd.DataFrame, tbl: pd.DataFrame, out_dir: Path) -> Path:
+# ------------------------------------------------------------------------ C
+def _morans(v, idx):
+    z = v - v.mean()
+    den = (z * z).sum()
+    return float((z * z[idx].mean(1)).sum() / den) if den > 0 else np.nan
+
+
+def spatial(df: pd.DataFrame, out_dir: Path, rng) -> tuple[pd.DataFrame, dict]:
+    from scipy import stats
+    from sklearn.neighbors import NearestNeighbors
+
+    print(f"\n{'=' * 74}\nC  WHERE — do similar cells sit together, and how far does it reach?\n{'=' * 74}")
+    rows = []
+    for (cond, img), g in df.groupby(["condition", "image_id"], sort=False):
+        if len(g) < 40:
+            continue
+        xy = g[["centroid_x", "centroid_y"]].to_numpy(float)
+        _, idx = NearestNeighbors(n_neighbors=K + 1).fit(xy).kneighbors(xy)
+        idx = idx[:, 1:]
+        r = {"stiff": g.stiff.iloc[0], "image_id": img, "n_cells": len(g)}
+        for col in ("endmt_score", "endmt_sizeadj"):
+            v = g[col].to_numpy()
+            obs = _morans(v, idx)
+            null = np.array([_morans(rng.permutation(v), idx) for _ in range(N_PERM)])
+            r[f"moran_{col}"] = obs
+            r[f"z_{col}"] = (obs - null.mean()) / null.std() if null.std() > 0 else np.nan
+        nb = NearestNeighbors(radius=CROWD_RADIUS).fit(xy).radius_neighbors(
+            xy, return_distance=False)
+        crowd = np.array([len(x) - 1 for x in nb], float)
+        r["rho_crowding"] = (stats.spearmanr(crowd, g["endmt_score"])[0]
+                             if crowd.std() > 0 else np.nan)
+        rows.append(r)
+    tiles = pd.DataFrame(rows)
+    tiles.to_csv(out_dir / "tile_spatial_stats.csv", index=False)
+
+    print(f"  Moran's I over {K} nearest neighbours, per tile, against {N_PERM} "
+          "shuffles of\n  the same scores over the same cell positions. "
+          "0 = arrangement looks random;\n  z > 2 = similar cells sit together "
+          "more than chance allows.")
+    for col, lab in (("endmt_score", "raw score"), ("endmt_sizeadj", "size removed")):
+        for s in (STIFF, SOFT):
+            g = tiles[tiles.stiff == s]
+            print(f"    {lab:<13} {s:>7}: median I={g[f'moran_{col}'].median():+.3f}  "
+                  f"median z={g[f'z_{col}'].median():4.1f}  "
+                  f"tiles with z>2: {np.mean(g[f'z_{col}'] > 2):.0%}  (of {len(g)})")
+
+    print(f"\n  Correlation between two cells' scores (size removed), by distance:")
+    curve = {}
+    for s in (STIFF, SOFT):
+        acc = {i: [] for i in range(len(DIST_BINS) - 1)}
+        groups = df[df.stiff == s].groupby("image_id")
+        for img in rng.choice(list(groups.groups), min(150, groups.ngroups), replace=False):
+            g = groups.get_group(img)
+            xy = g[["centroid_x", "centroid_y"]].to_numpy(float)
+            v = g["endmt_sizeadj"].to_numpy()
+            if v.std() == 0:
+                continue
+            z = (v - v.mean()) / v.std()
+            iu = np.triu_indices(len(g), 1)
+            dist = np.sqrt(((xy[:, None] - xy[None]) ** 2).sum(-1))[iu]
+            prod = (z[:, None] * z[None])[iu]
+            b = np.digitize(dist, DIST_BINS) - 1
+            for i in acc:
+                sel = b == i
+                if sel.any():
+                    acc[i].append(prod[sel].mean())
+        curve[s] = [float(np.mean(acc[i])) for i in acc]
+        print(f"    {s:>7}: " + "  ".join(
+            f"{DIST_BINS[i]}-{DIST_BINS[i + 1]}:{curve[s][i]:+.2f}" for i in acc))
+    diam = {s: float(2 * np.sqrt(df[df.stiff == s]["area_px"].median() / np.pi))
+            for s in (STIFF, SOFT)}
+    print(f"    (typical cell diameter: {STIFF} {diam[STIFF]:.0f} px, "
+          f"{SOFT} {diam[SOFT]:.0f} px)")
+    pd.DataFrame({"bin_lo": DIST_BINS[:-1], "bin_hi": DIST_BINS[1:],
+                  **{f"corr_{s}": curve[s] for s in curve}}).to_csv(
+        out_dir / "correlation_by_distance.csv", index=False)
+
+    print(f"\n  Do high-EndMT cells favour crowded or sparse spots? Spearman of a "
+          f"cell's\n  score against the number of cells within {CROWD_RADIUS:.0f} px, per tile:")
+    for s in (STIFF, SOFT):
+        g = tiles[tiles.stiff == s]["rho_crowding"].dropna()
+        lean = "crowded" if g.median() > 0 else "sparse"
+        print(f"    {s:>7}: median rho={g.median():+.3f}, positive in "
+              f"{np.mean(g > 0):.0%} of tiles  -> high scores lean {lean}")
+    return tiles, {"curve": curve, "diam": diam}
+
+
+def field_scale(df: pd.DataFrame, out_dir: Path) -> None:
+    """Structure at the scale of a whole imaging field, which the per-tile
+    statistics above cannot see.
+
+    Two different things show up here and need keeping apart. A pattern that
+    sits in the same grid cell in every field is the microscope, not the cells:
+    biology has no way to know where the centre of the camera is. A pattern
+    that moves from field to field could be biology or uneven staining, and
+    this dataset cannot tell those apart.
+    """
+    from scipy import stats
+
+    print(f"\n{'=' * 74}\nD  LARGER PATCHES — across a whole 3x3 field\n{'=' * 74}")
+    d = df.copy()
+    rc = d["image_id"].str.extract(r"_r(?P<r>\d+)c(?P<c>\d+)$").astype(float)
+    d["r"], d["c"] = rc["r"], rc["c"]
+    t = (d.dropna(subset=["r", "c"])
+         .groupby(["stiff", "position", "r", "c"])["endmt_score"].mean()
+         .reset_index())
+    rows = []
+    for s in (STIFF, SOFT):
+        g = t[t.stiff == s].copy()
+        g["dev"] = g["endmt_score"] - g.groupby("position")["endmt_score"].transform("mean")
+        total = float(((g.endmt_score - g.endmt_score.mean()) ** 2).mean())
+        within = float((g.dev ** 2).mean())
+        grid = g.groupby(["r", "c"])["dev"].mean()
+        fixed_share = float(grid.var(ddof=0) / g.dev.var(ddof=0))
+        p_r = stats.f_oneway(*[x.dev for _, x in g.groupby("r")]).pvalue
+        p_c = stats.f_oneway(*[x.dev for _, x in g.groupby("c")]).pvalue
+        print(f"  {s}:")
+        print(f"    {within / total:.0%} of tile-to-tile variation lies between tiles "
+              "of the same field")
+        print(f"    of that, {fixed_share:.0%} is a fixed grid pattern shared by every "
+              f"field (row p={p_r:.2g}, column p={p_c:.2g})")
+        print(f"    centre tile vs field mean: {grid.loc[(2.0, 2.0)]:+.3f}   "
+              f"grid pattern range {grid.max() - grid.min():.3f}   "
+              f"typical tile spread (SD) {g.dev.std():.3f}")
+        rows.append({"stiffness": s, "share_within_field": within / total,
+                     "fixed_grid_share": fixed_share,
+                     "centre_tile_dev": float(grid.loc[(2.0, 2.0)]),
+                     "grid_range": float(grid.max() - grid.min()),
+                     "tile_sd": float(g.dev.std())})
+    pd.DataFrame(rows).to_csv(out_dir / "field_scale.csv", index=False)
+    print("  A fixed centre-vs-edge pattern is an imaging signature (uneven "
+          "illumination\n  or focus across the field). It is real but small; "
+          "most field-scale\n  variation moves from field to field.")
+
+
+# -------------------------------------------------------------------- plots
+def plot_distribution(df: pd.DataFrame, res: dict, out_dir: Path) -> Path:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    soft = df[df.stiff == "5kPa"]["value"].to_numpy()
-    stiff = df[df.stiff == "500kPa"]["value"].to_numpy()
-    c_soft, c_stiff = "#c0392b", "#2471a3"
-
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2))
 
     ax = axes[0]
-    # Histogram the LOG of the value on even bins. Plotting the raw value on a
-    # log axis with density=True divides each count by its bin width in raw
-    # units, and log-spaced bins are vanishingly narrow at the low end, which
-    # inflates a few percent of dim cells into a spurious second peak.
-    bins = np.linspace(-2, 1.8, 80)
-    ax.hist(np.log10(stiff), bins=bins, density=True, color=c_stiff,
-            alpha=0.55, label="500 kPa (stiff)")
-    ax.hist(np.log10(soft), bins=bins, density=True, color=c_soft,
-            alpha=0.55, label="5 kPa (soft)")
-    ticks = np.array([0.01, 0.1, 1, 10])
-    ax.set_xticks(np.log10(ticks))
-    ax.set_xticklabels([f"{t:g}" for t in ticks])
-    ax.set_xlabel("TAGLN / DAPI  (log scale)")
+    bins = np.linspace(0, 1, 51)
+    for s, c, lab in ((STIFF, C_STIFF, "500 kPa (stiff)"), (SOFT, C_SOFT, "5 kPa (soft)")):
+        v = df[(df.stiff == s) & ~df.clamped]["endmt_score"]
+        ax.hist(v, bins=bins, density=True, color=c, alpha=0.5, label=lab)
+    ax.axvline(0.5, color="#555555", ls=":", lw=1)
+    ax.set_xlabel("EndMT score  (0 = endothelial, 1 = mesenchymal)")
     ax.set_ylabel("density")
-    ax.set_title("One smooth peak each — a gradient,\nnot two cell types",
-                 fontsize=10)
+    ax.set_title("One continuous range per substrate\n(cells pinned at 0 or 1 by the "
+                 "clamp left out)", fontsize=9.5)
     ax.legend(fontsize=8, frameon=False)
 
     ax = axes[1]
-    ax.plot(tbl.percentile, tbl.ratio, "o-", color="#6b3fa0", lw=2)
-    ax.axhline(1.0, color="#888888", ls=":", lw=1)
-    ax.axhline(float(tbl.ratio.mean()), color="#bbbbbb", ls="--", lw=1,
-               label="a uniform shift would be flat")
-    ax.set_xlabel("percentile of the population")
-    ax.set_ylabel("soft / stiff")
-    ax.set_title("The top of the distribution moves\nmuch more than the bottom",
-                 fontsize=10)
+    grid = np.linspace(0, 1, 201)
+    for s, c in ((STIFF, C_STIFF), (SOFT, C_SOFT)):
+        v = df[df.stiff == s]["endmt_score"].to_numpy()
+        ax.plot(grid, [(v > t).mean() for t in grid], color=c, lw=2,
+                label=f"{s}: {res['above_half'][s]:.0%} above 0.5")
+    ax.axvline(0.5, color="#555555", ls=":", lw=1)
+    ax.set_xlabel("EndMT score threshold")
+    ax.set_ylabel("fraction of cells above")
+    ax.set_title("How many cells clear a given score", fontsize=9.5)
     ax.legend(fontsize=8, frameon=False)
 
     ax = axes[2]
-    grid = np.logspace(np.log10(0.05), np.log10(30), 160)
-    ax.plot(grid, [(stiff > t).mean() for t in grid], color=c_stiff, lw=2,
-            label="500 kPa")
-    ax.plot(grid, [(soft > t).mean() for t in grid], color=c_soft, lw=2,
-            label="5 kPa")
-    thr = float(np.percentile(stiff, 90))
-    ax.axvline(thr, color="#444444", ls=":", lw=1)
-    ax.annotate(f"stiff 90th pct\n{(soft > thr).mean():.0%} vs "
-                f"{(stiff > thr).mean():.0%}",
-                xy=(thr, 0.55), xytext=(thr * 1.4, 0.72), fontsize=8,
-                arrowprops=dict(arrowstyle="->", lw=0.8))
+    b = res["band"]
+    ax.plot(b["median_area"], b["soft"], "o-", color=C_SOFT, ms=4, label="5 kPa")
+    ax.plot(b["median_area"], b["stiff"], "o-", color=C_STIFF, ms=4, label="500 kPa")
     ax.set_xscale("log")
-    ax.set_xlabel("TAGLN / DAPI threshold")
-    ax.set_ylabel("fraction of cells above")
-    ax.set_title("How many cells clear a given level", fontsize=10)
+    ax.set_xlabel("cell area (px, log scale)")
+    ax.set_ylabel("mean EndMT score")
+    ax.set_title(f"Same-size cells: soft still higher, by {res['size_matched_diff']:+.3f}\n"
+                 f"(vs {res['raw_diff']:+.3f} unmatched)", fontsize=9.5)
     ax.legend(fontsize=8, frameon=False)
 
     for a in axes:
@@ -213,92 +382,112 @@ def plot_distribution(df: pd.DataFrame, tbl: pd.DataFrame, out_dir: Path) -> Pat
     return path
 
 
-def pick_typical(df: pd.DataFrame, stiff: str) -> str:
-    """The position whose mean sits closest to that condition's median."""
-    sub = df[df.stiff == stiff]
-    per_pos = sub.groupby("position")["value"].mean()
-    return str((per_pos - per_pos.median()).abs().idxmin())
+def _typical(df: pd.DataFrame, s: str) -> str:
+    per = df[df.stiff == s].groupby("position")["endmt_score"].mean()
+    return str((per - per.median()).abs().idxmin())
 
 
-def plot_maps(df: pd.DataFrame, out_dir: Path) -> Path:
+def plot_maps(df: pd.DataFrame, sp: dict, out_dir: Path) -> Path:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LogNorm
     from scipy.ndimage import gaussian_filter
 
-    picks = [("5kPa", pick_typical(df, "5kPa"), "5 kPa (soft)"),
-             ("500kPa", pick_typical(df, "500kPa"), "500 kPa (stiff)")]
-    vmin, vmax = 0.1, 20.0
+    fig = plt.figure(figsize=(13, 9.2))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 0.9])
+    nb = 40
+    edges = np.linspace(0, 3 * TILE, nb + 1)
+    ext = (0, 3 * TILE, 0, 3 * TILE)
 
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 10))
-    for row, (stiff, pos, label) in enumerate(picks):
-        g = df[(df.stiff == stiff) & (df.position == pos)]
-        x, y, v = (g.field_x.to_numpy(), g.field_y.to_numpy(),
-                   g.value.to_numpy())
+    for row, (s, lab) in enumerate(((SOFT, "5 kPa (soft)"), (STIFF, "500 kPa (stiff)"))):
+        pos = _typical(df, s)
+        g = df[(df.stiff == s) & (df.position == pos)]
 
-        ax = axes[row, 0]
-        sc = ax.scatter(x, y, c=np.clip(v, vmin, vmax), s=7, cmap="magma",
-                        norm=LogNorm(vmin=vmin, vmax=vmax), linewidths=0)
-        ax.set_title(f"{label} — {len(g)} cells at {pos}\n"
-                     f"each dot is one cell", fontsize=9)
-        fig.colorbar(sc, ax=ax, fraction=0.046, label="TAGLN / DAPI")
+        ax = fig.add_subplot(gs[row, 0])
+        sc = ax.scatter(g.field_x, g.field_y, c=g.endmt_score, cmap="coolwarm",
+                        vmin=0, vmax=1, s=6, linewidths=0)
+        ax.set_title(f"{lab}, {pos}: {len(g):,} cells\none dot per cell", fontsize=9)
+        ax.set_xlim(0, 3 * TILE)
+        ax.set_ylim(0, 3 * TILE)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(sc, ax=ax, fraction=0.046, label="EndMT score")
 
-        # binned + smoothed, so regional structure would be visible if present
-        ax = axes[row, 1]
-        nb = 34
-        edges = np.linspace(0, 3 * TILE, nb + 1)
-        tot, _, _ = np.histogram2d(y, x, bins=[edges, edges], weights=v)
-        cnt, _, _ = np.histogram2d(y, x, bins=[edges, edges])
+        # normalised convolution: smooth the sum and the count separately, so
+        # empty bins do not drag the average toward an invented fill value
+        tot, _, _ = np.histogram2d(g.field_y, g.field_x, bins=[edges, edges],
+                                   weights=g.endmt_score)
+        cnt, _, _ = np.histogram2d(g.field_y, g.field_x, bins=[edges, edges])
+        sm_t, sm_c = gaussian_filter(tot, 1.2), gaussian_filter(cnt, 1.2)
         with np.errstate(invalid="ignore", divide="ignore"):
-            mean = tot / cnt
-        filled = np.where(cnt > 0, mean, np.nan)
-        sm = gaussian_filter(np.nan_to_num(filled, nan=np.nanmean(filled)),
-                             sigma=1.1)
-        im = ax.imshow(sm, origin="lower", cmap="magma",
-                       norm=LogNorm(vmin=vmin, vmax=vmax),
-                       extent=(0, 3 * TILE, 0, 3 * TILE))
-        ax.contour(sm, levels=[1, 2, 4, 8], colors="white", linewidths=0.6,
-                   alpha=0.55, extent=(0, 3 * TILE, 0, 3 * TILE))
-        ax.set_title(f"{label} — smoothed local average", fontsize=9)
-        fig.colorbar(im, ax=ax, fraction=0.046, label="TAGLN / DAPI")
+            sm = np.where(sm_c > 0.15, sm_t / sm_c, np.nan)
+        ax = fig.add_subplot(gs[row, 1])
+        im = ax.imshow(sm, origin="lower", cmap="coolwarm", vmin=0, vmax=1, extent=ext)
+        cs = ax.contour(sm, levels=[0.3, 0.5, 0.7], colors="black",
+                        linewidths=0.6, alpha=0.6, extent=ext)
+        ax.clabel(cs, fontsize=6, fmt="%.1f")
+        ax.set_title(f"{lab}: local average, contours at 0.3 / 0.5 / 0.7", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, label="EndMT score")
 
-        for a in axes[row]:
-            a.set_xticks([])
-            a.set_yticks([])
-    fig.suptitle("High-TAGLN cells are scattered throughout, not gathered into "
-                 "regions\n(same colour scale on all four panels)", fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    ax = fig.add_subplot(gs[:, 2])
+    mids = [(DIST_BINS[i] + DIST_BINS[i + 1]) / 2 for i in range(len(DIST_BINS) - 1)]
+    for s, c, lab in ((SOFT, C_SOFT, "5 kPa"), (STIFF, C_STIFF, "500 kPa")):
+        ax.plot(mids, sp["curve"][s], "o-", color=c, lw=2, ms=4, label=lab)
+        ax.axvline(sp["diam"][s], color=c, ls=":", lw=1)
+    ax.axhline(0, color="#888888", lw=0.8)
+    ax.set_xlabel("distance between two cells (px)")
+    ax.set_ylabel("correlation of their EndMT scores\n(cell size removed)")
+    ax.set_title("How far does similarity reach?\ndotted lines = one typical cell "
+                 "diameter", fontsize=9)
+    ax.legend(fontsize=8, frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    fig.suptitle("Neighbouring cells resemble each other over a few cell diameters; "
+                 "some fields also carry broader patches (left, middle)",
+                 fontsize=10.5)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     path = out_dir / "endmt_spatial_maps.png"
-    fig.savefig(path, dpi=180)
+    fig.savefig(path, dpi=170)
     plt.close(fig)
     return path
 
 
 def main() -> None:
     root = _default_local_root()
-    ap = argparse.ArgumentParser(
-        description="Quantify and draw the EndMT distribution on 260516.")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--master", type=Path, default=root / "master_table.csv")
-    ap.add_argument("--norm-stats", type=Path,
-                    default=root / "normalization_stats.json")
+    ap.add_argument("--norm-stats", type=Path, default=root / "normalization_stats.json")
     ap.add_argument("--out-dir", type=Path, default=root / "landscape")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
     tee = _Tee(args.out_dir / "endmt_landscape_log.txt")
     sys.stdout = tee
     try:
         print(f"plot_endmt_landscape.py — {datetime.now():%Y-%m-%d %H:%M:%S}")
         df = load(args.master, args.norm_stats)
-        print(f"  {len(df):,} cells on {DATE}; "
-              f"{df.groupby(['stiff', 'position']).ngroups} positions")
-        tbl = report_numbers(df, args.out_dir)
-        p1 = plot_distribution(df, tbl, args.out_dir)
-        p2 = plot_maps(df, args.out_dir)
-        print(f"\nWrote {args.out_dir / 'quantile_table.csv'}")
-        print(f"Wrote {p1}")
-        print(f"Wrote {p2}")
+        print(f"  {len(df):,} cells on {DATE}: "
+              + ", ".join(f"{s} {n:,}" for s, n in df.groupby('stiff').size().items()))
+        res = shape_and_spread(df, args.out_dir, rng)
+        _, sp = spatial(df, args.out_dir, rng)
+        field_scale(df, args.out_dir)
+        p1 = plot_distribution(df, res, args.out_dir)
+        p2 = plot_maps(df, sp, args.out_dir)
+        print(f"\n  [caveat] one dish per substrate: these numbers describe this dish "
+              "pair.\n  [caveat] touching cells can share some signal at their "
+              "boundary, which\n           inflates similarity at the shortest "
+              "distance; the reach beyond one\n           cell diameter is the part "
+              "that bleed-through cannot explain.")
+        for f in ("spread_table.csv", "size_matched_difference.csv",
+                  "tile_spatial_stats.csv", "correlation_by_distance.csv",
+                  "field_scale.csv"):
+            print(f"Wrote {args.out_dir / f}")
+        print(f"Wrote {p1}\nWrote {p2}")
     finally:
         sys.stdout = sys.__stdout__
         print(f"Log saved -> {args.out_dir / 'endmt_landscape_log.txt'}")
