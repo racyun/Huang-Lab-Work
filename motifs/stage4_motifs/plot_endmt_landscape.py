@@ -39,8 +39,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-TAGLN = "ch1_cellwise_mean_intensity"
-DAPI = "ch3_cellwise_mean_intensity"
+# ch1 is DAPI and ch3 is TAGLN: the chN names follow CH numbering, which is
+# the reverse of the RGB plane order used in Stage 1.
+DAPI = "ch1_cellwise_mean_intensity"
+TAGLN = "ch3_cellwise_mean_intensity"
 DATE = "260516"
 TILE = 681.0                      # tile frame width, from the centroid range
 QUANTILES = [5, 10, 25, 50, 75, 90, 95, 99]

@@ -37,8 +37,10 @@ H = pathlib.Path.home()
 K = 8
 MIN_CELLS = 30          # Moran's I is unstable on tiny tiles
 
-TAGLN = "ch1_cellwise_mean_intensity"
-DAPI = "ch3_cellwise_mean_intensity"
+# ch1 is DAPI and ch3 is TAGLN: the chN names follow CH numbering, which is
+# the reverse of the RGB plane order used in Stage 1.
+DAPI = "ch1_cellwise_mean_intensity"
+TAGLN = "ch3_cellwise_mean_intensity"
 
 
 def hedges_g(a, b):

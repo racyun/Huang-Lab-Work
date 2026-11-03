@@ -48,14 +48,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-TAGLN = "ch1_cellwise_mean_intensity"                   # mesenchymal marker
+DAPI = "ch1_cellwise_mean_intensity"                    # nuclear control
 VECAD = "ch2_cellwise_mean_membrane_intensity"          # endothelial marker
-DAPI = "ch3_cellwise_mean_intensity"                    # nuclear control
+TAGLN = "ch3_cellwise_mean_intensity"                   # mesenchymal marker
 INTENSITY_COLS = [TAGLN, VECAD, DAPI]
 
-# Channel names are the REVERSE of the tile's RGB plane order; see
-# stage1_segmentation/check_channel_order.py. ch1 is TAGLN, ch2 VE-cadherin,
-# ch3 DAPI.
+# The chN_ column names follow the CH naming, which is the REVERSE of the
+# tile's RGB plane order. automated_cellwise_feature_extraction.py writes
+# ch1 <- DAPI_IDX=2, ch2 <- VECAD_IDX=1, ch3 <- TAGLN_IDX=0, so ch1 is the
+# nuclear channel and ch3 is the mesenchymal marker. Confirmed empirically:
+# ch3/(ch2+ch3) correlates with the stored endmt_score at 0.82, the other
+# assignment at 0.48.
 
 SIGNAL_DATE = "260516"
 BATCH_STIFFNESS = "500kPa"
