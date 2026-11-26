@@ -35,8 +35,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from exn_columns import LABEL_SOURCES, LABELS  # noqa: E402
-from exn_data import (SPLIT_CODE, TOUCHING_EDGE_COL, build_inputs,  # noqa: E402
-                      default_work_dir, ego_graph, load_cache, run_name)
+from exn_data import (TOUCHING_EDGE_COL, build_inputs, default_work_dir,  # noqa: E402
+                      ego_graph, load_cache, run_name)
 from exn_model import ExnCellClassifier  # noqa: E402
 
 FAILS = []
