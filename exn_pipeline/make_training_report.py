@@ -2,22 +2,34 @@
 """Build a PDF report from train_all.log and baselines.log.
 
 Pages: summary, score tables for both labels, each GNN against its matched
-baseline, per-epoch training curves, then both raw logs. Needs matplotlib.
+baseline, per-epoch training curves, then the raw logs. With --test-csv
+(results/test_summary.csv from score_exn.py --split test) the report opens with
+the test results: scores with 95% CIs, precision/recall/F1 at the validation
+threshold, and the paired differences. Needs matplotlib and pandas.
 
 Usage
 -----
-    python exn_pipeline/make_training_report.py <train_all.log> <baselines.log> <out.pdf>
+    python exn_pipeline/make_training_report.py <train_all.log> <baselines.log> <out.pdf> \
+        [--test-csv test_summary.csv] [--leakage-log leakage_trained.log]
 """
+import argparse
 import re
-import sys
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 
-train_log, base_log, out = map(Path, sys.argv[1:4])
+_ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+_ap.add_argument("train_log", type=Path)
+_ap.add_argument("base_log", type=Path)
+_ap.add_argument("out", type=Path)
+_ap.add_argument("--test-csv", type=Path)
+_ap.add_argument("--leakage-log", type=Path)
+ARGS = _ap.parse_args()
+train_log, base_log, out = ARGS.train_log, ARGS.base_log, ARGS.out
 
 INK, INK2, MUTED, GRID = "#0b0b0b", "#52514e", "#8a8984", "#e4e3df"
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
@@ -263,6 +275,161 @@ def gap(label, g, b):
     return runs[f"{label}_{g}"]["final_auprc"] - base[(label, b)]["auprc"]
 
 
+# ---------- test results
+MODEL_ORDER = [r_[0] for r_ in ROWS]
+PAIR_ORDER = ["GNN-A - HGB own", "GNN-A - HGB nbr avg (A)", "GNN-B - GNN-A",
+              "GNN-B - HGB nbr avg (B)", "GNN-B - GNN-B no junction",
+              "HGB nbr avg (B) - HGB nbr avg (B, no junction)"]
+PAIR_NAME = {
+    "GNN-A - HGB own": "GNN-A vs own features only",
+    "GNN-A - HGB nbr avg (A)": "GNN-A vs neighbour averages (A)",
+    "GNN-B - GNN-A": "Neighbours' markers/labels (B − A)",
+    "GNN-B - HGB nbr avg (B)": "GNN-B vs neighbour averages (B)",
+    "GNN-B - GNN-B no junction": "Touching nbrs' VE-cad, GNN",
+    "HGB nbr avg (B) - HGB nbr avg (B, no junction)": "Touching nbrs' VE-cad, trees",
+}
+test = pd.read_csv(ARGS.test_csv) if ARGS.test_csv else None
+
+
+def T(label, model):
+    row = test[(test.label == label) & (test.model == model)]
+    return row.iloc[0]
+
+
+def test_tables_page(pdf):
+    fig = plt.figure(figsize=(8.5, 11))
+    fig.text(0.07, 0.95, "Final results: held-out test wells", fontsize=15, weight="bold")
+    fig.text(0.07, 0.915,
+             "Scored once, after every model was final. 95% intervals from resampling wells. "
+             "Precision, recall and F1\nuse the threshold chosen on validation (best F1), so "
+             "the test set never picks its own threshold.", fontsize=8.5, color=INK2,
+             linespacing=1.4)
+    cols = ["Model", "AUPRC [95% CI]", "× chance", "Within-field\nAUROC [95% CI]",
+            "Precision", "Recall", "F1"]
+    top = 0.86
+    for label, title in (("red", "Red display class"), ("tagln_high", "TAGLN-high")):
+        prev = T(label, "GNN-A").prevalence
+        n = int(T(label, "GNN-A").n_cells)
+        fig.text(0.07, top, title, fontsize=11, weight="bold")
+        cells = []
+        for m in MODEL_ORDER:
+            t = T(label, m)
+            cells.append([m, f"{t.auprc:.3f} [{t.auprc_ci_low:.3f}, {t.auprc_ci_high:.3f}]",
+                          f"{t.auprc / prev:.1f}×",
+                          f"{t.within_field_auroc:.3f} [{t.within_field_auroc_ci_low:.3f}, "
+                          f"{t.within_field_auroc_ci_high:.3f}]",
+                          f"{t.test_precision:.3f}", f"{t.test_recall:.3f}", f"{t.test_f1:.3f}"])
+        ax = fig.add_axes([0.07, top - 0.33, 0.86, 0.31])
+        ax.axis("off")
+        tb = ax.table(cellText=cells, colLabels=cols, cellLoc="left", colLoc="left",
+                      colWidths=[0.25, 0.20, 0.08, 0.20, 0.09, 0.09, 0.09], bbox=[0, 0, 1, 1])
+        tb.auto_set_font_size(False)
+        tb.set_fontsize(7.6)
+        for (i, j), c in tb.get_celld().items():
+            c.set_edgecolor(GRID)
+            c.set_linewidth(0.6)
+            if i == 0:
+                c.set_text_props(weight="bold", color=INK)
+                c.set_facecolor("#f3f2ef")
+            elif cells[i - 1][0].startswith("GNN"):
+                c.set_text_props(weight="bold")
+                c.set_facecolor("#eef4fc")
+        fig.text(0.07, top - 0.355, f"{n:,} test cells in 52 held-out wells; {100 * prev:.2f}% "
+                 f"positive, so a random guess scores AUPRC {prev:.3f}.", fontsize=8, color=MUTED)
+        top -= 0.43
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def test_diff_page(pdf):
+    """Forest plot of the paired AUPRC differences on test."""
+    fig, axes = plt.subplots(1, 2, figsize=(8.5, 5.2), sharey=True)
+    fig.subplots_adjust(left=0.28, right=0.97, top=0.8, bottom=0.13, wspace=0.08)
+    fig.text(0.07, 0.94, "Paired differences on the test wells", fontsize=13, weight="bold")
+    fig.text(0.07, 0.88, "AUPRC of the first model minus the second, same cells. Bars = 95% "
+             "interval from resampling wells;\nan interval that clears 0 means the difference "
+             "holds across wells.", fontsize=8.5, color=INK2, linespacing=1.4)
+    ys = list(range(len(PAIR_ORDER)))[::-1]
+    for ax, label in zip(axes, ["red", "tagln_high"]):
+        for y, p in zip(ys, PAIR_ORDER):
+            t = T(label, f"Δ {p}")
+            c = MUTED if "VE-cad" in PAIR_NAME[p] else BLUE
+            ax.plot([t.auprc_ci_low, t.auprc_ci_high], [y, y], color=c, lw=2,
+                    solid_capstyle="round")
+            ax.scatter([t.auprc], [y], s=40, color=c, zorder=3, edgecolor="white", lw=1.2)
+            ax.text(t.auprc_ci_high + 0.004, y, f"{t.auprc:+.3f}", va="center", fontsize=7.5,
+                    color=INK)
+        ax.axvline(0, color=INK2, lw=0.8)
+        ax.set_xlim(-0.01, 0.17)
+        ax.set_title("Red display class" if label == "red" else "TAGLN-high", loc="left",
+                     fontsize=10, weight="bold")
+        ax.set_xlabel("Difference in test AUPRC")
+        ax.grid(axis="x", color=GRID, lw=0.6)
+        ax.set_axisbelow(True)
+        for s in ("top", "right", "left"):
+            ax.spines[s].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+    axes[0].set_yticks(ys, [PAIR_NAME[p] for p in PAIR_ORDER])
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def test_summary():
+    def a(label, m):
+        return T(label, m).auprc
+
+    def d(label, p):
+        t = T(label, f"Δ {p}")
+        return f"{t.auprc:+.3f} [{t.auprc_ci_low:+.3f}, {t.auprc_ci_high:+.3f}]"
+
+    pr, pt = T("red", "GNN-A").prevalence, T("tagln_high", "GNN-A").prevalence
+    rb, tb = T("red", "GNN-B no junction"), T("tagln_high", "GNN-B no junction")
+    leak = ""
+    if ARGS.leakage_log and "ALL CHECKS PASSED" in ARGS.leakage_log.read_text():
+        n_pass = ARGS.leakage_log.read_text().count("PASS ")
+        leak = (f"Leakage checks on the trained models: all {n_pass} passed (the target "
+                f"cell's own markers and labels\nchange its prediction by exactly 0; raw "
+                f"output at the end of this report).")
+    blocks = [
+        ("p", "Per-cell binary classification on Carver's ExN dataset (319 fields, 1.23M "
+              "cells), split by well:\n60% train, 20% validation, 20% test. No model ever "
+              "sees the target cell's own markers or labels.\nTest wells were scored once "
+              "(2026-11-26), after every model was final.\n" + leak),
+        ("h", "Headline (test wells)"),
+        ("p", f"Red display class: GNN-B with touching neighbours' VE-cad hidden reaches "
+              f"AUPRC {rb.auprc:.3f}\n[{rb.auprc_ci_low:.3f}, {rb.auprc_ci_high:.3f}], "
+              f"{rb.auprc / pr:.1f}× the random-guess score of {pr:.3f}; within-field AUROC "
+              f"{rb.within_field_auroc:.3f}."),
+        ("p", f"TAGLN-high: the same model reaches AUPRC {tb.auprc:.3f} [{tb.auprc_ci_low:.3f}, "
+              f"{tb.auprc_ci_high:.3f}], {tb.auprc / pt:.1f}× the random-guess\nscore of "
+              f"{pt:.3f}; within-field AUROC {tb.within_field_auroc:.3f}."),
+        ("h", "What the numbers say"),
+        ("p", f"1. The GNN beats gradient-boosted trees given the same information, for both "
+              f"labels and versions:\n   red A {d('red', 'GNN-A - HGB nbr avg (A)')}, "
+              f"red B {d('red', 'GNN-B - HGB nbr avg (B)')};\n   TAGLN-high A "
+              f"{d('tagln_high', 'GNN-A - HGB nbr avg (A)')}, TAGLN-high B "
+              f"{d('tagln_high', 'GNN-B - HGB nbr avg (B)')}."),
+        ("p", f"2. Neighbours' markers and labels add the most (GNN-B − GNN-A): red "
+              f"{d('red', 'GNN-B - GNN-A')},\n   TAGLN-high {d('tagln_high', 'GNN-B - GNN-A')}."),
+        ("p", f"3. The junction a target shares with touching neighbours explains little of "
+              f"that gain: hiding their\n   VE-cad costs red {d('red', 'GNN-B - GNN-B no junction')} "
+              f"and TAGLN-high {d('tagln_high', 'GNN-B - GNN-B no junction')}.\n"
+              f"   The no-junction GNN-B is the conservative headline number."),
+        ("p", "4. AUPRC cannot be compared across labels (about 5% of cells are red, about 11% "
+              "TAGLN-high).\n   Relative to chance, and ranked within a field, red is "
+              "predicted better than TAGLN-high."),
+        ("p", f"5. Test agrees with validation: the models rank in the same order. GNN-B AUPRC, "
+              f"validation → test:\n   red {r['red_B']:.3f} → {a('red', 'GNN-B'):.3f}; "
+              f"TAGLN-high {r['tagln_high_B']:.3f} → {a('tagln_high', 'GNN-B'):.3f}. TAGLN-high "
+              f"is lower on test for every\n   model, baselines included, so its test wells are "
+              f"harder rather than the GNN overfitting."),
+        ("p", "6. Open question for Carver: TAGLN-high leans heavily on neighbours' TAGLN calls. "
+              "Check whether\n   the way TAGLN-high was called couples a cell's call to its "
+              "neighbours' before reading it as biology."),
+    ]
+    return blocks
+
+
 r = {k: v["final_auprc"] for k, v in runs.items()}
 summary = [
     ("p", "All 6 GNN runs and all 10 baselines finished on 2026-11-26 on Lightning (GPU). Scores below\n"
@@ -294,10 +461,17 @@ summary = [
 ]
 
 with PdfPages(out) as pdf:
-    text_page(pdf, "ExN cell classification: training results (validation)", summary)
+    if test is not None:
+        text_page(pdf, "ExN cell classification: final results", test_summary())
+        test_tables_page(pdf)
+        test_diff_page(pdf)
+    else:
+        text_page(pdf, "ExN cell classification: training results (validation)", summary)
     tables_page(pdf)
     gap_page(pdf)
     curve_page(pdf)
+    if ARGS.leakage_log:
+        log_pages(pdf, ARGS.leakage_log, "Raw log: leakage_trained.log")
     log_pages(pdf, base_log, "Raw log: baselines.log")
     log_pages(pdf, train_log, "Raw log: train_all.log")
 print("wrote", out)
